@@ -74,12 +74,70 @@ pub fn log(status: &'static str) {
 #[derive(Default)]
 pub struct UiBridge {
     snapshot: Mutex<UiSnapshot>,
+    lookup_requested: AtomicBool,
+    confirmation: Mutex<LookupConfirmation>,
     hwnd: AtomicIsize,
     size: AtomicU32,
     pub finished: AtomicBool,
 }
 
+#[derive(Default)]
+struct LookupConfirmation {
+    offer: Option<(u64, String)>,
+    answer: Option<LookupAnswer>,
+}
+
+pub type LookupAnswer = (u64, Option<(String, String)>);
+
+pub const LOOKUP_OFFER: u32 = WM_APP + 7;
+pub const DISMISS_LOOKUP: u32 = WM_APP + 8;
+
 impl UiBridge {
+    pub fn request_lookup(&self) {
+        self.lookup_requested.store(true, Ordering::Release);
+    }
+    pub fn take_lookup_request(&self) -> bool {
+        self.lookup_requested.swap(false, Ordering::AcqRel)
+    }
+    pub fn offer_lookup_title(&self, offer: Option<(u64, String)>) {
+        let mut state = self.confirmation.lock().unwrap();
+        if state.offer == offer && (offer.is_some() || state.answer.is_none()) {
+            return;
+        }
+        let message = if offer.is_some() {
+            LOOKUP_OFFER
+        } else {
+            DISMISS_LOOKUP
+        };
+        state.answer = None;
+        state.offer = offer;
+        drop(state);
+        let hwnd = HWND(self.hwnd.load(Ordering::Acquire) as *mut _);
+        if !hwnd.is_invalid() {
+            let _ = unsafe { PostMessageW(hwnd, message, WPARAM(0), LPARAM(0)) };
+        }
+    }
+    pub fn lookup_offer(&self) -> Option<(u64, String)> {
+        self.confirmation.lock().unwrap().offer.clone()
+    }
+    pub fn lookup_offer_is_current(&self, id: u64) -> bool {
+        self.confirmation
+            .lock()
+            .unwrap()
+            .offer
+            .as_ref()
+            .is_some_and(|(current, _)| *current == id)
+    }
+    pub fn answer_lookup(&self, id: u64, fields: Option<(String, String)>) {
+        let mut state = self.confirmation.lock().unwrap();
+        if state.offer.as_ref().is_some_and(|(n, _)| *n == id) {
+            state.offer = None;
+            state.answer = Some((id, fields));
+        }
+    }
+    pub fn take_lookup_answer(&self) -> Option<LookupAnswer> {
+        self.confirmation.lock().unwrap().answer.take()
+    }
     pub fn attach(&self, hwnd: HWND) {
         self.hwnd.store(hwnd.0 as isize, Ordering::Release);
     }
@@ -133,5 +191,37 @@ impl UiBridge {
                 let _ = PostMessageW(hwnd, WM_APP + 1, WPARAM(0), LPARAM(0));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_consent_is_explicit_and_one_use() {
+        let bridge = UiBridge::default();
+        assert!(!bridge.take_lookup_request());
+        assert_eq!(bridge.take_lookup_answer(), None);
+        bridge.request_lookup();
+        assert!(bridge.take_lookup_request());
+        assert!(!bridge.take_lookup_request());
+        bridge.offer_lookup_title(Some((1, "第一首".into())));
+        bridge.answer_lookup(1, None);
+        assert_eq!(bridge.take_lookup_answer(), Some((1, None)));
+        bridge.offer_lookup_title(Some((2, "第二首".into())));
+        bridge.offer_lookup_title(Some((3, "第三首".into())));
+        let fields = Some(("手填歌名".to_string(), "本地歌手".to_string()));
+        bridge.answer_lookup(2, fields.clone());
+        assert_eq!(bridge.take_lookup_answer(), None);
+        assert!(bridge.lookup_offer_is_current(3));
+        bridge.answer_lookup(3, fields.clone());
+        assert!(!bridge.lookup_offer_is_current(3));
+        assert_eq!(bridge.take_lookup_answer(), Some((3, fields.clone())));
+        assert_eq!(bridge.take_lookup_answer(), None);
+        bridge.offer_lookup_title(Some((4, "第四首".into())));
+        bridge.answer_lookup(4, fields);
+        bridge.offer_lookup_title(None);
+        assert_eq!(bridge.take_lookup_answer(), None);
     }
 }

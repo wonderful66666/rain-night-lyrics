@@ -6,8 +6,15 @@ use std::fmt::Write;
 use std::sync::LazyLock;
 
 const LIMIT: usize = 20_000;
+const PACKET_BYTES: usize = LIMIT / 4 * 3;
+const MAX_SOURCE_BYTES: usize = 1024 * 1024;
+const MAX_LINES: usize = 8192;
+const MAX_LINE_BYTES: usize = 8192;
+const MAX_TIMES_PER_LINE: usize = 64;
+const MAX_CUES: usize = 4096;
+const MAX_TEXT_BYTES: usize = 256 * 1024;
 static STAMP: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\[(\d{1,3}):([0-5]\d)(?:[.:](\d{1,3}))?\]").unwrap());
+    LazyLock::new(|| Regex::new(r"^\[([0-9]{1,3}):([0-5][0-9])(?:[.:]([0-9]{1,3}))?\]").unwrap());
 static OFFSET: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\[offset:\s*([+-]?\d{1,8})\s*\]").unwrap());
 
@@ -17,16 +24,30 @@ struct Cue {
     text: String,
 }
 
-fn cues(raw: &str) -> Vec<Cue> {
+fn short_text(s: &str) -> &str {
+    s.char_indices().nth(320).map_or(s, |(end, _)| &s[..end])
+}
+
+fn cues(raw: &str) -> Option<Vec<Cue>> {
+    if raw.len() > MAX_SOURCE_BYTES {
+        return None;
+    }
     let offset = OFFSET
         .captures(raw)
         .and_then(|c| c[1].parse::<i64>().ok())
         .unwrap_or(0);
     let mut result = Vec::new();
-    for line in raw.lines() {
+    let mut text_bytes = 0;
+    for (index, line) in raw.lines().enumerate() {
+        if index >= MAX_LINES || line.len() > MAX_LINE_BYTES {
+            return None;
+        }
         let mut rest = line.trim_start_matches('\u{feff}').trim();
         let mut times = Vec::new();
         while let Some(c) = STAMP.captures(rest) {
+            if times.len() >= MAX_TIMES_PER_LINE || result.len() + times.len() >= MAX_CUES {
+                return None;
+            }
             let minutes: i64 = c[1].parse().unwrap_or_default();
             let seconds: i64 = c[2].parse().unwrap_or_default();
             let fraction = c.get(3).map(|m| m.as_str()).unwrap_or("");
@@ -35,16 +56,20 @@ fn cues(raw: &str) -> Vec<Cue> {
             times.push(((minutes * 60 + seconds) * 1000 + milli - offset).clamp(0, 59_999_999));
             rest = &rest[c[0].len()..];
         }
-        let text = rest.trim().chars().take(320).collect::<String>();
+        let text = short_text(rest.trim());
+        text_bytes += times.len() * text.len();
+        if text_bytes > MAX_TEXT_BYTES {
+            return None;
+        }
         for ms in times {
             result.push(Cue {
                 ms,
-                text: text.clone(),
+                text: text.to_owned(),
             });
         }
     }
     result.sort_by_key(|cue| cue.ms);
-    result
+    Some(result)
 }
 
 #[derive(Debug)]
@@ -64,23 +89,19 @@ impl Lyrics {
         translation: &str,
         provider: &'static str,
     ) -> Option<Self> {
-        let main = cues(raw);
+        let main = cues(raw)?;
         if !main
             .iter()
             .any(|cue| !cue.text.is_empty() && cue.text != "//")
         {
             return None;
         }
-        let title: String = title
-            .replace(['[', ']', '\r', '\n'], " ")
-            .chars()
-            .take(320)
-            .collect();
+        let title = short_text(title).replace(['[', ']', '\r', '\n'], " ");
         Some(Self {
             header: format!("[ti:{title}]\n[length:{duration:.3}]\n"),
             duration,
             main,
-            translation: cues(translation),
+            translation: cues(translation).unwrap_or_default(),
             provider,
         })
     }
@@ -126,9 +147,12 @@ impl Lyrics {
     }
 }
 
-fn lrc(rows: &[Cue], header: &str) -> String {
+fn lrc(rows: &[Cue], header: &str) -> Option<String> {
     let mut text = String::from(header);
     for cue in rows {
+        if text.len() + cue.text.len() > PACKET_BYTES {
+            return None;
+        }
         let ms = cue.ms;
         let _ = writeln!(
             text,
@@ -139,7 +163,7 @@ fn lrc(rows: &[Cue], header: &str) -> String {
             cue.text
         );
     }
-    text
+    (text.len() <= PACKET_BYTES).then_some(text)
 }
 
 fn window(rows: &[Cue], at: i64, radius: usize) -> &[Cue] {
@@ -163,8 +187,8 @@ struct Packet<'a> {
 
 fn encode(m: &Media, lyrics: &str, translation: &str) -> String {
     let packet = Packet {
-        title: &m.song.title,
-        artist: &m.song.artist,
+        title: short_text(&m.song.title),
+        artist: "",
         sent: m.sent,
         position: m.position,
         duration: m.duration,
@@ -176,26 +200,26 @@ fn encode(m: &Media, lyrics: &str, translation: &str) -> String {
     STANDARD.encode(serde_json::to_vec(&packet).expect("serializable media packet"))
 }
 
+const METADATA_LRC: &str = "[ti:metadata]\n[offset:60000]\n[00:00.000]♪\n[00:00.001]\n";
+
 pub fn metadata_only(m: &Media) -> String {
     let mut current = m.clone();
     current.sent = crate::media::now_ms();
     current.position = None;
-    let text = format!(
-        "[ti:metadata]\n[00:00.000]{}\n[00:00.001]\n",
-        m.song.title.replace(['\r', '\n'], " ")
-    );
-    encode(&current, &text, "")
+    encode(&current, METADATA_LRC, "")
 }
 
 pub fn build(m: &Media, lyrics: Option<&Lyrics>) -> String {
     if let Some(words) = lyrics {
-        let main = lrc(&words.main, &words.header);
-        let translation = lrc(&words.translation, "");
-        let full = encode(m, &main, &translation);
-        if full.len() <= LIMIT {
-            return full;
-        }
-        if !translation.is_empty() {
+        if let Some(main) = lrc(&words.main, &words.header) {
+            if let Some(translation) = lrc(&words.translation, "")
+                && !translation.is_empty()
+            {
+                let full = encode(m, &main, &translation);
+                if full.len() <= LIMIT {
+                    return full;
+                }
+            }
             let plain = encode(m, &main, "");
             if plain.len() <= LIMIT {
                 return plain;
@@ -203,22 +227,60 @@ pub fn build(m: &Media, lyrics: Option<&Lyrics>) -> String {
         }
         let at = words.at(m);
         for radius in [24, 12, 6, 3, 1, 0] {
-            let main = lrc(window(&words.main, at, radius), &words.header);
-            let trans = lrc(window(&words.translation, at, radius), "");
+            let Some(main) = lrc(window(&words.main, at, radius), &words.header) else {
+                continue;
+            };
+            let Some(trans) = lrc(window(&words.translation, at, radius), "") else {
+                continue;
+            };
             let value = encode(m, &main, &trans);
             if value.len() <= LIMIT {
                 return value;
             }
         }
-        return encode(m, &lrc(window(&words.main, at, 0), &words.header), "");
+        if let Some(main) = lrc(window(&words.main, at, 0), &words.header) {
+            let plain = encode(m, &main, "");
+            if plain.len() <= LIMIT {
+                return plain;
+            }
+        }
     }
-    encode(m, "", "")
+    encode(m, METADATA_LRC, "")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::media::{Song, Source};
+    #[test]
+    fn unverified_recording_replaces_stale_lyrics_without_sending_match_evidence() {
+        let mut m = Media::anonymous(true);
+        m.song.title = "Silver Meadow".into();
+        m.song.artist = "local-only performer".into();
+        m.position = Some(0.0);
+        m.sent = 480;
+        let packet: serde_json::Value =
+            serde_json::from_slice(&STANDARD.decode(build(&m, None)).unwrap()).unwrap();
+        assert_eq!(packet["title"], m.song.title);
+        assert_eq!(packet["artist"], "");
+        assert_eq!(packet["sent"], m.sent);
+        assert_eq!(packet["position"], 0.0);
+        assert_eq!(packet["translatedText"], "");
+        let neutral = Lyrics::new(
+            "metadata",
+            0.0,
+            packet["lyricsText"].as_str().unwrap(),
+            "",
+            "测试",
+        )
+        .unwrap();
+        for position in [0.0, 0.001, 3.0, 30.0, 180.0] {
+            m.position = Some(position);
+            for delay in [-30_000, 0, 30_000] {
+                assert!(neutral.displayed(&m, delay).is_none());
+            }
+        }
+    }
     #[test]
     fn disc_anchor_uses_the_same_cue_delay_translation_and_long_silences() {
         let words = Lyrics::new(
@@ -252,11 +314,62 @@ mod tests {
     }
     #[test]
     fn timestamps_offset_and_multiple_stamps() {
-        let c = cues("[offset:150]\n[00:01.5][01:20.324]雨\n[00:02]停");
+        let c = cues("[offset:150]\n[00:01.5][01:20.324]雨\n[00:02]停").unwrap();
         assert_eq!(
             c.iter().map(|c| c.ms).collect::<Vec<_>>(),
             [1350, 1850, 80174]
         );
+    }
+    #[test]
+    fn parsing_enforces_source_and_expanded_lyric_budgets() {
+        assert!(cues(&"x".repeat(MAX_SOURCE_BYTES + 1)).is_none());
+        assert!(cues(&"x".repeat(MAX_LINE_BYTES + 1)).is_none());
+        assert!(cues(&"\n".repeat(MAX_LINES + 1)).is_none());
+        assert!(cues(&"[00:01]".repeat(MAX_TIMES_PER_LINE + 1)).is_none());
+        assert!(cues(&"[00:01]a\n".repeat(MAX_CUES + 1)).is_none());
+        let repeated = format!(
+            "{}{}\n",
+            "[00:01]".repeat(MAX_TIMES_PER_LINE),
+            "雨".repeat(320)
+        );
+        assert!(cues(&repeated).is_some());
+        let oversized = repeated.repeat(5);
+        assert!(cues(&oversized).is_none());
+        let main = Lyrics::new("曲", 1.0, "[00:00]雨", &oversized, "测试").unwrap();
+        assert_eq!(main.main.len(), 1);
+        assert!(main.translation.is_empty());
+        assert!(cues("[00:01.１２３]雨").unwrap().is_empty());
+    }
+    #[test]
+    fn encoded_packets_remain_bounded_with_escaped_and_multibyte_fields() {
+        let m = Media {
+            song: Song {
+                title: "\0".repeat(20_000),
+                artist: "🌂".repeat(20_000),
+                source: Source::NetEase,
+            },
+            position: Some(5.0),
+            duration: 80.0,
+            playing: true,
+            rate: 1.0,
+            sent: 10000,
+        };
+        let line = format!("[00:05]{}\n", "\u{1}".repeat(320));
+        let words = Lyrics::new(
+            &m.song.title,
+            80.0,
+            &line.repeat(40),
+            &line.repeat(40),
+            "测试",
+        )
+        .unwrap();
+        for packet in [build(&m, None), build(&m, Some(&words)), metadata_only(&m)] {
+            assert!(packet.len() <= LIMIT);
+            let value: serde_json::Value =
+                serde_json::from_slice(&STANDARD.decode(packet).unwrap()).unwrap();
+            assert_eq!(value["artist"], "");
+            assert_eq!(value["title"], "\0".repeat(320));
+        }
     }
     #[test]
     fn published_schema_and_long_song_seek() {
@@ -275,7 +388,7 @@ mod tests {
             song: Song {
                 title: "《测试》".into(),
                 artist: "歌手".into(),
-                source: Source::Bilibili,
+                source: Source::Browser,
             },
             duration: 220.0,
             position: Some(174.2),

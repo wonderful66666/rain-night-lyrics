@@ -1,6 +1,6 @@
-use crate::media::{Media, Source};
+use crate::media::{Media, Song, Source};
 use crate::protocol::Lyrics;
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use serde_json::Value;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -15,6 +15,21 @@ static DIVIDER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\s+[-–—]\s+|\s*[|｜丨]\s*").unwrap());
 static LABEL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)[（(]\s*(?:official (?:music )?(?:video|audio)|lyrics?(?: video)?|mv|hd|4k|高音质|无损音质)\s*[）)]").unwrap()
+});
+static EDITIONS: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new([
+        r"(?i)(?-u:\blive\b)|现场|現場",
+        r"(?i)(?-u:\b(remix|rework|bootleg)\b)|混音",
+        r"(?i)(?-u:\bcover\b)|翻唱",
+        r"(?i)(?-u:\b(instrumental|karaoke|off vocal)\b)|伴奏|纯音乐|純音樂",
+        r"(?i)(?-u:\b(acoustic|unplugged)\b)|不插电|不插電",
+        r"(?i)(?-u:\b(sped up|nightcore)\b)|加速",
+        r"(?i)(?-u:\bslowed\b)|慢速|降速",
+        r"(?i)(?-u:\bremaster(?:ed)?\b)|重制|重製",
+        r"(?i)(?-u:\bdemo\b)|样带|樣帶",
+        r"(?i)(?-u:\bedit\b)|剪辑版|剪輯版",
+    ])
+    .unwrap()
 });
 
 fn key(s: &str) -> String {
@@ -88,92 +103,261 @@ fn names(title: &str, video: bool) -> Vec<String> {
     result
 }
 
+fn query_title(song: &Song) -> Option<&str> {
+    match song.source {
+        Source::Browser | Source::NetEase => {
+            (!song.title.trim().is_empty()).then_some(song.title.as_str())
+        }
+        Source::Other => None,
+    }
+}
+
 #[derive(Clone)]
 struct Candidate {
+    provider: Provider,
     title: String,
     artist: String,
+    album_editions: u16,
     seconds: f64,
     id: u64,
     lrc: String,
 }
 
-fn score(m: &Media, titles: &[String], s: &Candidate) -> Option<i32> {
-    let name = key(&s.title);
-    let index = titles.iter().position(|n| key(n) == name)?;
-    let artist = key(&m.song.artist);
-    let performer = key(&s.artist);
-    let artist_matches = !artist.is_empty()
-        && !performer.is_empty()
-        && (performer.contains(&artist) || artist.contains(&performer));
-    if !m.song.source.from_video() && !artist.is_empty() && !performer.is_empty() && !artist_matches
+fn editions(text: &str) -> u16 {
+    EDITIONS
+        .matches(text)
+        .iter()
+        .fold(0, |flags, i| flags | 1 << i)
+}
+
+fn artist_key(name: &str) -> String {
+    let mut names: Vec<_> = name
+        .split(['/', '&', '＆', '、', ';', '；', ','])
+        .map(key)
+        .filter(|n| !n.is_empty())
+        .collect();
+    names.sort();
+    names.dedup();
+    names.join("/")
+}
+
+fn enough_catalogs(finished: bool, responses: usize, local_artist: &str) -> bool {
+    finished && (responses == 2 || (responses == 1 && !artist_key(local_artist).is_empty()))
+}
+
+fn track_key(title: &str) -> String {
+    let normalized: String = title
+        .chars()
+        .map(|c| match c {
+            '！'..='～' => char::from_u32(c as u32 - 0xfee0).unwrap(),
+            '‐' | '‑' | '–' | '—' => '-',
+            '‘' | '’' => '\'',
+            _ => c,
+        })
+        .flat_map(char::to_lowercase)
+        .collect();
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+struct Match<'a> {
+    song: &'a Candidate,
+    artist: String,
+    confirmed_artist: bool,
+    duration_error: Option<f64>,
+}
+
+fn assess<'a>(
+    m: &Media,
+    title: &str,
+    local_artist: &str,
+    version: u16,
+    song: &'a Candidate,
+) -> Option<Match<'a>> {
+    let artist = artist_key(&song.artist);
+    if title != track_key(&song.title)
+        || artist.is_empty()
+        || version != (editions(&song.title) | song.album_editions)
     {
         return None;
     }
-    let looped = m.song.title.to_lowercase();
-    let repeated = m.duration > 420.0
-        && ["循环", "loop", "repeat"]
-            .iter()
-            .any(|s| looped.contains(s));
-    let mut value = 100_000 - 5_000 * index as i32;
-    if m.duration > 0.0 && s.seconds > 0.0 && !repeated {
-        let difference = (s.seconds - m.duration).abs();
-        if difference > if artist_matches { 35.0 } else { 18.0 } {
+    let confirmed_artist = artist == local_artist;
+    if !confirmed_artist && (!local_artist.is_empty() || key(title).chars().count() < 3) {
+        return None;
+    }
+    let mut error = None;
+    if m.duration.is_finite() && m.duration > 0.0 && song.seconds.is_finite() && song.seconds > 0.0
+    {
+        let delta = (song.seconds - m.duration).abs();
+        if delta > 5.0 {
             return None;
         }
-        value += ((22.0 - difference).max(0.0) * 1_000.0).round() as i32;
+        error = Some(delta);
     }
-    if artist_matches {
-        value += if artist == performer { 45_000 } else { 40_000 };
-    }
-    if performer.chars().count() >= 2
-        && m.song.source.from_video()
-        && (titles.iter().any(|n| key(n) == performer) || key(&m.song.title).contains(&performer))
-    {
-        value += 25_000;
-    }
-    Some(value)
+    Some(Match {
+        song,
+        artist,
+        confirmed_artist,
+        duration_error: error,
+    })
 }
 
-fn ranked_songs(m: &Media, titles: &[String], candidates: Vec<Candidate>) -> Vec<Candidate> {
-    let mut ranked: Vec<_> = candidates
-        .into_iter()
-        .filter_map(|c| Some((score(m, titles, &c)?, c)))
-        .collect();
-    ranked.sort_by_key(|(value, _)| std::cmp::Reverse(*value));
-    let Some((top, first)) = ranked.first() else {
-        return vec![];
-    };
-    let performer = key(&first.artist);
-    if (m.song.source.from_video() || m.song.artist.is_empty())
-        && !performer.is_empty()
-        && ranked
-            .iter()
-            .skip(1)
-            .take_while(|(value, _)| top - value <= 350)
-            .any(|(_, other)| !other.artist.is_empty() && key(&other.artist) != performer)
-    {
+fn ranked_songs<'a>(m: &Media, candidates: &'a [Candidate], complete: bool) -> Vec<&'a Candidate> {
+    let timed = m.duration.is_finite() && m.duration > 0.0;
+    if !timed && !complete {
         return vec![];
     }
-    ranked
+    let title = track_key(&m.song.title);
+    let artist = artist_key(&m.song.artist);
+    let version = editions(&m.song.title);
+    let mut matches: Vec<_> = candidates
+        .iter()
+        .filter_map(|s| assess(m, &title, &artist, version, s))
+        .collect();
+    let confirmed = matches.iter().any(|v| v.confirmed_artist);
+    if confirmed {
+        matches.retain(|v| v.confirmed_artist);
+    } else if !complete {
+        return vec![];
+    }
+    matches.sort_by(|a, b| {
+        a.duration_error
+            .unwrap_or(f64::INFINITY)
+            .total_cmp(&b.duration_error.unwrap_or(f64::INFINITY))
+    });
+    let Some(best) = matches.first() else {
+        return vec![];
+    };
+    if !confirmed && best.duration_error.is_none_or(|delta| delta > 1.5) {
+        return vec![];
+    }
+    if matches.iter().enumerate().any(|(index, v)| {
+        v.artist != best.artist
+            || (v.song.seconds - best.song.seconds).abs() > if timed { 3.0 } else { 1.0 }
+            || (!timed
+                && matches.len() > 1
+                && (v.song.seconds <= 0.0
+                    || matches[..index].iter().any(|other| {
+                        other.song.provider == v.song.provider && other.song.id != v.song.id
+                    })))
+    }) {
+        return vec![];
+    }
+    matches
         .into_iter()
-        .map(|(_, c)| c)
-        .filter(|c| performer.is_empty() || key(&c.artist) == performer)
-        .take(2)
+        .filter(|v| confirmed || v.duration_error.is_some_and(|d| d <= 1.5))
+        .map(|v| v.song)
+        .take(4)
         .collect()
+}
+
+fn has_related_title(m: &Media, candidates: &[Candidate]) -> bool {
+    let hints = names(&m.song.title, m.song.source.from_video());
+    candidates.iter().any(|s| {
+        let title = key(&s.title);
+        hints.iter().any(|n| key(n) == title)
+    })
+}
+
+fn lyric_identity_matches(raw: &str, song: &Candidate) -> bool {
+    raw.lines().take(40).all(|line| {
+        let line = line.trim().trim_start_matches('\u{feff}');
+        let Some((tag, value)) = line
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .and_then(|s| s.split_once(':'))
+        else {
+            return true;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            return true;
+        }
+        if tag.eq_ignore_ascii_case("ti") {
+            return key(value) == key(&song.title);
+        }
+        if tag.eq_ignore_ascii_case("ar") {
+            return artist_key(value) == artist_key(&song.artist);
+        }
+        true
+    })
 }
 
 fn json(s: &Value, name: &str) -> String {
     s[name].as_str().unwrap_or("").to_owned()
 }
 
+fn netease_recordings(body: &Value) -> Result<Vec<Candidate>, ()> {
+    if body["code"].as_i64() != Some(200) {
+        return Err(());
+    }
+    let result = body["result"].as_object().ok_or(())?;
+    let count = result
+        .get("songCount")
+        .map(|v| v.as_u64().ok_or(()))
+        .transpose()?;
+    let rows = match result.get("songs") {
+        None | Some(Value::Null) if count == Some(0) => return Ok(vec![]),
+        Some(Value::Array(rows)) if rows.is_empty() && count.is_some_and(|n| n > 0) => {
+            return Err(());
+        }
+        Some(Value::Array(rows)) => rows,
+        _ => return Err(()),
+    };
+    let mut out = Vec::new();
+    for row in rows.iter().take(12) {
+        let id = row["id"].as_u64().filter(|id| *id > 0).ok_or(())?;
+        let title = row["name"]
+            .as_str()
+            .filter(|name| !name.trim().is_empty())
+            .ok_or(())?;
+        let mut artists = ["ar", "artists"]
+            .iter()
+            .filter_map(|field| row[*field].as_array());
+        let credits = artists.find(|items| !items.is_empty()).ok_or(())?;
+        let names: Option<Vec<_>> = credits
+            .iter()
+            .map(|a| a["name"].as_str().filter(|name| !name.trim().is_empty()))
+            .collect();
+        let artist = names.ok_or(())?.join(" / ");
+        let duration = |field: &str| {
+            row[field]
+                .as_f64()
+                .filter(|ms| ms.is_finite() && *ms >= 0.0)
+        };
+        let primary = duration("dt");
+        let seconds = primary
+            .filter(|ms| *ms > 0.0)
+            .or_else(|| duration("duration"))
+            .or(primary)
+            .ok_or(())?
+            / 1000.0;
+        let album = ["/al/name", "/album/name"]
+            .iter()
+            .filter_map(|path| row.pointer(path)?.as_str())
+            .find(|name| !name.is_empty())
+            .unwrap_or("");
+        out.push(Candidate {
+            provider: Provider::NetEase,
+            id,
+            title: title.into(),
+            artist,
+            seconds,
+            album_editions: editions(album),
+            lrc: String::new(),
+        });
+    }
+    Ok(out)
+}
+
 #[derive(Debug)]
 pub enum Outcome {
     Found(Lyrics),
     Missing,
+    Ambiguous,
     Unavailable,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Provider {
     NetEase,
     LrcLib,
@@ -184,8 +368,9 @@ impl Catalog {
     pub fn new() -> Self {
         let config = ureq::Agent::config_builder()
             .https_only(true)
+            .max_redirects(0)
             .timeout_global(Some(Duration::from_secs(5)))
-            .user_agent("RainNightLyrics/0.1")
+            .user_agent(concat!("RainNightLyrics/", env!("CARGO_PKG_VERSION")))
             .build();
         Self(config.into())
     }
@@ -198,9 +383,11 @@ impl Catalog {
         for (k, v) in params {
             request = request.query(*k, *v);
         }
-        request
-            .call()
-            .map_err(|_| ())?
+        let mut response = request.call().map_err(|_| ())?;
+        if !response.status().is_success() {
+            return Err(());
+        }
+        response
             .body_mut()
             .with_config()
             .limit(4 * 1024 * 1024)
@@ -208,56 +395,31 @@ impl Catalog {
             .map_err(|_| ())
     }
 
-    fn search(&self, provider: Provider, title: &str, artist: &str) -> Result<Vec<Candidate>, ()> {
+    fn search(&self, provider: Provider, title: &str) -> Result<Vec<Candidate>, ()> {
         let mut out = Vec::new();
         if provider == Provider::NetEase {
-            let term = format!("{title} {artist}");
             let body = self.get(
                 "https://music.163.com/api/cloudsearch/pc",
                 &[
-                    ("s", term.trim()),
+                    ("s", title),
                     ("type", "1"),
                     ("limit", "12"),
                     ("offset", "0"),
                 ],
             )?;
-            if body["code"].as_i64() != Some(200) {
-                return Err(());
-            }
-            if let Some(list) = body.pointer("/result/songs").and_then(Value::as_array) {
-                for s in list {
-                    let artist = s["ar"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|a| a["name"].as_str())
-                        .collect::<Vec<_>>()
-                        .join(" / ");
-                    if let (Some(id), Some(name)) = (s["id"].as_u64(), s["name"].as_str()) {
-                        out.push(Candidate {
-                            id,
-                            title: name.into(),
-                            artist,
-                            seconds: s["dt"].as_f64().unwrap_or_default() / 1000.0,
-                            lrc: String::new(),
-                        });
-                    }
-                }
-            }
+            return netease_recordings(&body);
         } else {
-            let mut args = vec![("track_name", title)];
-            if !artist.is_empty() {
-                args.push(("artist_name", artist));
-            }
-            let body = self.get("https://lrclib.net/api/search", &args)?;
-            for s in body.as_array().ok_or(())? {
-                if let Some(lrc) = s["syncedLyrics"].as_str().filter(|s| !s.is_empty()) {
+            let body = self.get("https://lrclib.net/api/search", &[("track_name", title)])?;
+            for s in body.as_array().ok_or(())?.iter().take(50) {
+                if let Some(id) = s["id"].as_u64() {
                     out.push(Candidate {
-                        id: 0,
+                        provider,
+                        id,
                         title: json(s, "trackName"),
                         artist: json(s, "artistName"),
+                        album_editions: editions(s["albumName"].as_str().unwrap_or("")),
                         seconds: s["duration"].as_f64().unwrap_or_default(),
-                        lrc: lrc.into(),
+                        lrc: json(s, "syncedLyrics"),
                     });
                 }
             }
@@ -265,14 +427,13 @@ impl Catalog {
         Ok(out)
     }
 
-    fn fetch(
-        &self,
-        source: Provider,
-        s: &Candidate,
-        active: &impl Fn() -> bool,
-    ) -> Result<Option<Lyrics>, ()> {
-        if source == Provider::LrcLib {
-            return Ok(Lyrics::new(&s.title, s.seconds, &s.lrc, "", "LRCLIB"));
+    fn fetch(&self, s: &Candidate, active: &impl Fn() -> bool) -> Outcome {
+        if s.provider == Provider::LrcLib {
+            if !lyric_identity_matches(&s.lrc, s) {
+                return Outcome::Ambiguous;
+            }
+            return Lyrics::new(&s.title, s.seconds, &s.lrc, "", "LRCLIB")
+                .map_or(Outcome::Missing, Outcome::Found);
         }
         let id = s.id.to_string();
         let params = [
@@ -287,7 +448,7 @@ impl Catalog {
             "https://music.163.com/api/song/lyric/v1",
         ] {
             if !active() {
-                return Ok(None);
+                return Outcome::Missing;
             }
             let body = match self.get(url, &params) {
                 Ok(b) if b["code"].as_i64() == Some(200) => b,
@@ -297,7 +458,7 @@ impl Catalog {
                 }
             };
             if body["nolyric"].as_bool() == Some(true) {
-                return Ok(None);
+                return Outcome::Missing;
             }
             let raw = body
                 .pointer("/lrc/lyric")
@@ -307,20 +468,33 @@ impl Catalog {
                 .pointer("/tlyric/lyric")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if let Some(words) = Lyrics::new(&s.title, s.seconds, raw, translated, "网易云曲库")
-            {
-                return Ok(Some(words));
+            if !lyric_identity_matches(raw, s) {
+                return Outcome::Ambiguous;
+            }
+            if let Some(words) = Lyrics::new(
+                &s.title,
+                s.seconds,
+                raw,
+                if lyric_identity_matches(translated, s) {
+                    translated
+                } else {
+                    ""
+                },
+                "网易云曲库",
+            ) {
+                return Outcome::Found(words);
             }
         }
-        if failed { Err(()) } else { Ok(None) }
+        if failed {
+            Outcome::Unavailable
+        } else {
+            Outcome::Missing
+        }
     }
 
     pub fn lookup(&self, m: &Media, active: impl Fn() -> bool) -> Outcome {
-        let titles = names(&m.song.title, m.song.source.from_video());
-        let artist = if m.song.source.from_video() {
-            ""
-        } else {
-            m.song.artist.as_str()
+        let Some(title) = query_title(&m.song) else {
+            return Outcome::Missing;
         };
         let order = if m.song.source == Source::NetEase {
             [Provider::NetEase, Provider::LrcLib]
@@ -328,43 +502,47 @@ impl Catalog {
             [Provider::LrcLib, Provider::NetEase]
         };
         let mut service_error = false;
-        for term in titles.iter().take(3) {
-            for source in order {
+        let mut conflicting_lyrics = false;
+        let mut candidates = Vec::new();
+        let mut searched = 0;
+        let mut fetched = Vec::new();
+        for (i, source) in order.into_iter().enumerate() {
+            if !active() {
+                return Outcome::Missing;
+            }
+            match self.search(source, title) {
+                Ok(items) => {
+                    candidates.extend(items);
+                    searched += 1;
+                }
+                Err(()) => {
+                    service_error = true;
+                }
+            }
+            for song in ranked_songs(
+                m,
+                &candidates,
+                enough_catalogs(i == 1, searched, &m.song.artist),
+            ) {
                 if !active() {
                     return Outcome::Missing;
                 }
-                let candidates = match self.search(source, term, artist) {
-                    Ok(c) => c,
-                    Err(()) => {
-                        service_error = true;
-                        continue;
-                    }
-                };
-                let mut ranked = ranked_songs(m, &titles, candidates);
-                if ranked.is_empty()
-                    && source == Provider::NetEase
-                    && !artist.is_empty()
-                    && active()
-                {
-                    match self.search(source, term, "") {
-                        Ok(songs) => ranked = ranked_songs(m, &titles, songs),
-                        Err(()) => service_error = true,
-                    }
+                if fetched.contains(&(song.provider, song.id)) {
+                    continue;
                 }
-                for song in ranked {
-                    if !active() {
-                        return Outcome::Missing;
-                    }
-                    match self.fetch(source, &song, &active) {
-                        Ok(Some(lyrics)) => return Outcome::Found(lyrics),
-                        Err(()) => service_error = true,
-                        _ => {}
-                    }
+                fetched.push((song.provider, song.id));
+                match self.fetch(song, &active) {
+                    Outcome::Found(lyrics) => return Outcome::Found(lyrics),
+                    Outcome::Unavailable => service_error = true,
+                    Outcome::Ambiguous => conflicting_lyrics = true,
+                    Outcome::Missing => {}
                 }
             }
         }
         if service_error {
             Outcome::Unavailable
+        } else if conflicting_lyrics || (fetched.is_empty() && has_related_title(m, &candidates)) {
+            Outcome::Ambiguous
         } else {
             Outcome::Missing
         }
@@ -374,75 +552,246 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media::Song;
     #[test]
-    fn close_recordings_keep_millisecond_precision_and_real_ties_are_ambiguous() {
-        let m = Media {
+    fn all_supported_sources_search_only_the_exact_approved_title() {
+        let mut song = Song {
+            title: "【单曲循环】《窗前雨》 | 歌单".into(),
+            artist: "UP 主".into(),
+            source: Source::Browser,
+        };
+        for source in [Source::Browser, Source::NetEase] {
+            song.source = source;
+            assert_eq!(query_title(&song), Some(song.title.as_str()));
+        }
+        song.source = Source::Other;
+        assert!(query_title(&song).is_none());
+        song.source = Source::NetEase;
+        song.title = " ".into();
+        assert!(query_title(&song).is_none());
+    }
+    fn request(title: &str, artist: &str, duration: f64) -> Media {
+        Media {
             song: Song {
-                title: "《窗前雨》".into(),
-                artist: String::new(),
-                source: Source::Bilibili,
+                title: title.into(),
+                artist: artist.into(),
+                source: Source::Browser,
             },
-            duration: 204.0,
-            position: Some(10.0),
+            duration,
+            position: Some(0.0),
             playing: true,
             rate: 1.0,
             sent: 0,
-        };
-        let titles = names(&m.song.title, true);
-        let first = Candidate {
-            title: "窗前雨".into(),
-            artist: "甲乐团".into(),
-            seconds: 204.133,
-            id: 1,
-            lrc: String::new(),
-        };
-        let mut second = Candidate {
-            artist: "乙乐团".into(),
-            seconds: 203.226,
-            id: 2,
-            ..first.clone()
-        };
-        assert_eq!(
-            ranked_songs(&m, &titles, vec![second.clone(), first.clone()])[0].id,
-            1
-        );
-        second.seconds = 204.140;
-        assert!(ranked_songs(&m, &titles, vec![second, first]).is_empty());
+        }
     }
-    #[test]
-    fn browser_title_and_structured_artist_matching() {
-        assert_eq!(
-            names("【单曲循环】《月下的雨》- 音乐分享_哔哩哔哩_bilibili", true)[0],
-            "月下的雨"
-        );
-        assert_eq!(
-            names("歌手 - Moon Rain (Official Music Video) | Bilibili", true)[0],
-            "Moon Rain"
-        );
-        assert_eq!(names("Moon Rain (Live)", false)[0], "Moon Rain (Live)");
-        let m = Media {
-            song: Song {
-                title: "月下的雨".into(),
-                artist: "甲".into(),
-                source: Source::NetEase,
-            },
-            duration: 120.0,
-            position: None,
-            playing: true,
-            rate: 1.0,
-            sent: 1,
-        };
-        let mut c = Candidate {
-            title: "月下的雨".into(),
-            artist: "乙".into(),
-            seconds: 120.0,
-            id: 0,
+
+    fn recording(
+        provider: Provider,
+        id: u64,
+        title: &str,
+        artist: &str,
+        seconds: f64,
+    ) -> Candidate {
+        Candidate {
+            provider,
+            id,
+            title: title.into(),
+            artist: artist.into(),
+            album_editions: 0,
+            seconds,
             lrc: String::new(),
-        };
-        let options = names(&m.song.title, false);
-        assert!(score(&m, &options, &c).is_none());
-        c.artist = "甲".into();
-        assert!(score(&m, &options, &c).is_some());
+        }
+    }
+
+    fn catalog_recordings() -> Vec<Candidate> {
+        use Provider::{LrcLib, NetEase};
+        vec![
+            recording(LrcLib, 1, "Silver Meadow", "Amber Choir", 55.1),
+            recording(LrcLib, 2, "Silver Meadow", "Amber Choir", 65.0),
+            recording(LrcLib, 3, "Silver Meadow", "Amber Choir", 71.0),
+            recording(NetEase, 4, "Silver Meadow", "松林乐团", 121.6),
+            recording(NetEase, 5, "Silver Meadow", "北岸乐团", 157.9),
+            recording(NetEase, 6, "Silver Meadow (Edit)", "Nerai", 207.3),
+            recording(NetEase, 7, "Silver Meadow", "Nerai", 141.0),
+        ]
+    }
+
+    #[test]
+    fn joins_catalogs_before_resolving_a_title_without_an_artist() {
+        let mut songs = catalog_recordings();
+        let m = request("Silver Meadow", "", 141.15);
+        assert!(ranked_songs(&m, &songs[..3], false).is_empty());
+        assert!(ranked_songs(&m, &songs, false).is_empty());
+        assert_eq!(ranked_songs(&m, &songs, true)[0].id, 7);
+        assert!(ranked_songs(&request("Silver Meadow", "", 0.0), &songs, true).is_empty());
+        songs.push(recording(
+            Provider::LrcLib,
+            9,
+            "Silver Meadow",
+            "不同乐团",
+            140.25,
+        ));
+        assert!(ranked_songs(&m, &songs, true).is_empty());
+        assert_eq!(
+            ranked_songs(&request("Silver Meadow", "Nerai", 141.0), &songs, true)[0].id,
+            7
+        );
+        assert!(ranked_songs(&request("Silver Meadow", "Neira", 141.0), &songs, true).is_empty());
+    }
+
+    #[test]
+    fn approved_song_title_is_literal_and_local_artist_selects_matching_editions() {
+        let songs = catalog_recordings();
+        for title in [
+            "Nerai - Silver Meadow",
+            "Silver Meadow – Neira",
+            "Neira《Silver Meadow》",
+            "Ne - Silver Meadow",
+            "Random video | Silver Meadow",
+            "【翻唱】《Silver Meadow》",
+        ] {
+            assert!(ranked_songs(&request(title, "", 141.0), &songs, true).is_empty());
+        }
+        let wrapped = request(
+            "【单曲循环】《Silver Meadow》- 音乐分享_哔哩哔哩_bilibili",
+            "",
+            141.0,
+        );
+        assert!(ranked_songs(&wrapped, &songs, true).is_empty());
+        let typed = request("sILVER MEADOW", "Nerai", 0.0);
+        assert!(ranked_songs(&typed, &songs, false).is_empty());
+        assert_eq!(ranked_songs(&typed, &songs, true)[0].id, 7);
+        assert!(ranked_songs(&request("Silver Meadow", "Nerai", 207.3), &songs, true).is_empty());
+        assert_eq!(
+            ranked_songs(
+                &request("Silver Meadow (Edit)", "Nerai", 207.3),
+                &songs,
+                true
+            )[0]
+            .id,
+            6
+        );
+        assert!(
+            ranked_songs(
+                &request("Silver Meadow (Live)", "Nerai", 141.0),
+                &songs,
+                true
+            )
+            .is_empty()
+        );
+        assert!(ranked_songs(&request("Silver Meadow", "Nerai", 65.0), &songs, true).is_empty());
+    }
+
+    #[test]
+    fn title_with_a_dash_and_manual_artist_cannot_be_reinterpreted_as_a_different_song() {
+        let m = request("Day - Break", "North", 0.0);
+        let mut songs = vec![
+            recording(Provider::NetEase, 1, "Day", "Break", 180.0),
+            recording(Provider::LrcLib, 2, "Day Break", "North", 180.0),
+            recording(Provider::NetEase, 3, "Day – Break", "North", 180.0),
+        ];
+        assert_eq!(ranked_songs(&m, &songs, true)[0].id, 3);
+        songs.push(recording(
+            Provider::LrcLib,
+            4,
+            "Day - Break",
+            "North",
+            179.8,
+        ));
+        assert_eq!(ranked_songs(&m, &songs, true).len(), 2);
+        songs.push(recording(
+            Provider::LrcLib,
+            5,
+            "Day - Break",
+            "North",
+            180.1,
+        ));
+        assert!(ranked_songs(&m, &songs, true).is_empty());
+        songs.pop();
+        songs[3].seconds = 250.0;
+        assert!(ranked_songs(&m, &songs, true).is_empty());
+    }
+
+    #[test]
+    fn temporary_provider_failure_allows_only_a_confirmed_artist_after_both_attempts() {
+        let songs = catalog_recordings();
+        let selection = request("Silver Meadow", "Nerai", 0.0);
+        assert!(ranked_songs(&selection, &songs, enough_catalogs(false, 1, "Nerai")).is_empty());
+        assert_eq!(
+            ranked_songs(&selection, &songs, enough_catalogs(true, 1, "Nerai"))[0].id,
+            7
+        );
+        let name_only = request("Silver Meadow", "", 141.1);
+        assert!(ranked_songs(&name_only, &songs, enough_catalogs(true, 1, "")).is_empty());
+        assert!(!enough_catalogs(true, 0, "Nerai"));
+        assert!(!enough_catalogs(true, 1, " -- "));
+    }
+
+    #[test]
+    fn netease_legacy_and_modern_schemas_retain_the_same_recording_metadata() {
+        use serde_json::json;
+        let current = json!({"code":200,"result":{"songs":[{"id":19,"name":"River",
+            "ar":[{"name":"North"}],"al":{"name":"Live at Dawn"},"dt":141250}]}});
+        let legacy = json!({"code":200,"result":{"songs":[{"id":19,"name":"River",
+            "artists":[{"name":"North"}],"album":{"name":"Live at Dawn"},"duration":141250}]}});
+        for value in [&current, &legacy] {
+            let records = netease_recordings(value).unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].artist, "North");
+            assert_eq!(records[0].seconds, 141.25);
+            assert_eq!(records[0].album_editions, editions("Live"));
+        }
+    }
+
+    #[test]
+    fn netease_empty_and_malformed_results_are_distinct() {
+        use serde_json::json;
+        for result in [
+            json!({"songs":[]}),
+            json!({"songCount":0}),
+            json!({"songCount":0,"songs":null}),
+        ] {
+            assert!(
+                netease_recordings(&json!({"code":200,"result":result}))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        for result in [
+            Value::Null,
+            json!({}),
+            json!({"songs":"unexpected"}),
+            json!({"songCount":1,"songs":[]}),
+            json!({"songs":[{"id":1,"name":"River"}]}),
+        ] {
+            assert!(netease_recordings(&json!({"code":200,"result":result})).is_err());
+        }
+        assert!(netease_recordings(&json!({"code":429})).is_err());
+    }
+
+    #[test]
+    fn short_titles_conflicting_lyric_headers_and_hidden_editions_do_not_match() {
+        let mut song = recording(Provider::NetEase, 1, "雨", "乐团", 120.0);
+        assert!(
+            ranked_songs(&request("雨", "", 120.0), std::slice::from_ref(&song), true).is_empty()
+        );
+        assert!(lyric_identity_matches(
+            "[ti:雨]\n[ar:乐团]\n[00:20]雨",
+            &song
+        ));
+        assert!(!lyric_identity_matches("[ti:另一首]\n[00:20]雨", &song));
+        assert!(!lyric_identity_matches("[ar:大乐团]\n[00:20]雨", &song));
+        song.album_editions = editions("Live at the Arena");
+        assert!(ranked_songs(&request("雨", "乐团", 120.0), &[song], true).is_empty());
+    }
+
+    #[test]
+    fn confirmed_recording_without_lyrics_is_distinct_from_mislabeled_lyrics() {
+        let catalog = Catalog::new();
+        let mut song = recording(Provider::LrcLib, 1, "雨", "乐团", 120.0);
+        assert!(matches!(catalog.fetch(&song, &|| true), Outcome::Missing));
+        song.lrc = "[ti:另一首]\n[00:00]雨".into();
+        assert!(matches!(catalog.fetch(&song, &|| true), Outcome::Ambiguous));
+        song.lrc = "[ti:雨]\n[00:00]雨".into();
+        assert!(matches!(catalog.fetch(&song, &|| true), Outcome::Found(_)));
     }
 }

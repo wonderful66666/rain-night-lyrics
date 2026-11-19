@@ -1,5 +1,6 @@
 use crate::animation::{self, Anim};
-use crate::desktop::{UiBridge, UiSnapshot};
+use crate::desktop::{DISMISS_LOOKUP, LOOKUP_OFFER, UiBridge, UiSnapshot};
+use crate::lookup_dialog::LookupDialog;
 use crate::placement::{Anchor, Placement, disc_dpi};
 use crate::render::{CANVAS, Frame, Renderer};
 use std::cell::Cell;
@@ -482,8 +483,31 @@ impl Overlay {
                 return;
             };
             let opened = Instant::now();
+            let lookup = if self.view.media.is_some() {
+                MF_STRING
+            } else {
+                MF_STRING | MF_GRAYED
+            };
+            let _ = AppendMenuW(menu, lookup, 3, w!("为当前媒体查一次歌词…"));
             let _ = AppendMenuW(menu, MF_STRING, 1, w!("回到默认位置"));
             let _ = AppendMenuW(menu, MF_STRING, 2, w!("关闭取词器"));
+            let selected = self.select_menu(menu, point);
+            let t = t + opened.elapsed().as_secs_f64();
+            self.snapshot(t);
+            if selected == 1 {
+                self.placement.reset(&self.anchor);
+                self.layout(t, true);
+            }
+            if selected == 2 {
+                self.anim.close(t);
+            }
+            if selected == 3 {
+                self.bridge.request_lookup();
+            }
+        }
+    }
+    fn select_menu(&self, menu: HMENU, point: (i32, i32)) -> i32 {
+        unsafe {
             SetTimer(self.window, MENU_WAKE, 100, None);
             let selected = TrackPopupMenu(
                 menu,
@@ -497,15 +521,7 @@ impl Overlay {
             .0;
             let _ = KillTimer(self.window, MENU_WAKE);
             let _ = DestroyMenu(menu);
-            let t = t + opened.elapsed().as_secs_f64();
-            self.snapshot(t);
-            if selected == 1 {
-                self.placement.reset(&self.anchor);
-                self.layout(t, true);
-            }
-            if selected == 2 {
-                self.anim.close(t);
-            }
+            selected
         }
     }
     fn input(&mut self, msg: u32, p: LPARAM, t: f64) {
@@ -717,6 +733,7 @@ pub fn run(bridge: Arc<UiBridge>, stop: HANDLE, show: HANDLE) -> Result<()> {
     }
     app.draw(0.0)?;
     restack(hwnd);
+    let mut lookup: Option<LookupDialog> = None;
     let mut dirty = true;
     let mut timer = DeadlineTimer::new()?;
     let mut meter = Meter::default();
@@ -780,6 +797,9 @@ pub fn run(bridge: Arc<UiBridge>, stop: HANDLE, show: HANDLE) -> Result<()> {
             .min_by(f64::total_cmp);
         timer.set(start.elapsed().as_secs_f64(), deadline)?;
         let closing = app.anim.closing.is_some();
+        if closing || lookup.as_ref().is_some_and(|d| !d.current()) {
+            lookup = None;
+        }
         let mut handles = [HANDLE::default(); 3];
         let mut n = 0;
         if !closing {
@@ -817,6 +837,15 @@ pub fn run(bridge: Arc<UiBridge>, stop: HANDLE, show: HANDLE) -> Result<()> {
         }
         let mut m = MSG::default();
         while unsafe { PeekMessageW(&mut m, None, 0, 0, PM_REMOVE) }.as_bool() {
+            if app.anim.closing.is_some() || lookup.as_ref().is_some_and(|d| !d.current()) {
+                lookup = None;
+            }
+            if lookup.as_ref().is_some_and(|d| d.handle(&m)) {
+                if lookup.as_ref().is_some_and(|d| !d.current()) {
+                    lookup = None;
+                }
+                continue;
+            }
             if m.message == WM_QUIT {
                 app.anim.close(t);
                 dirty = true;
@@ -824,6 +853,22 @@ pub fn run(bridge: Arc<UiBridge>, stop: HANDLE, show: HANDLE) -> Result<()> {
             }
             if m.hwnd == hwnd {
                 match m.message {
+                    LOOKUP_OFFER | DISMISS_LOOKUP => {
+                        if app.anim.closing.is_none()
+                            && lookup.is_none()
+                            && let Some((id, title)) = app.bridge.lookup_offer()
+                        {
+                            match LookupDialog::open(hwnd, id, &title, Arc::clone(&app.bridge)) {
+                                Ok(dialog) if dialog.current() => {
+                                    dialog.show();
+                                    lookup = Some(dialog);
+                                }
+                                _ => app.bridge.answer_lookup(id, None),
+                            }
+                        }
+                        dirty = true;
+                        continue;
+                    }
                     SNAPSHOT => {
                         dirty |= app.snapshot(t) && !obscured;
                         continue;

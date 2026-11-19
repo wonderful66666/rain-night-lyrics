@@ -3,6 +3,7 @@ mod animation;
 mod audio;
 mod desktop;
 mod lookup;
+mod lookup_dialog;
 mod media;
 mod placement;
 mod protocol;
@@ -13,9 +14,8 @@ mod wallpaper;
 use audio::OutputWatch;
 use desktop::{UiBridge, UiSnapshot};
 use lookup::{Catalog, Outcome};
-use media::{Apartment, Media, Sessions, Song};
+use media::{Apartment, ApprovedTrack, LookupPermit, Media, Sessions, Song};
 use placement::CapsuleData;
-use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -27,7 +27,6 @@ use wallpaper::{Engine, ReloadReason, SingleInstance, StopSignal, WORKSHOP_ID};
 
 struct CacheEntry {
     until: Instant,
-    duration: f64,
     result: Outcome,
 }
 
@@ -35,9 +34,15 @@ fn duration_changed(old: f64, new: f64) -> bool {
     new > 0.0 && (old <= 0.0 || (new - old).abs() > 2.0)
 }
 
+fn lookup_changed(current: Option<(u64, f64)>, id: u64, duration: f64) -> bool {
+    current.is_none_or(|(previous, old_duration)| {
+        previous != id || duration_changed(old_duration, duration)
+    })
+}
+
 struct Worker {
     revision: Arc<AtomicU64>,
-    requests: mpsc::Sender<(u64, Media)>,
+    requests: mpsc::Sender<(u64, Media, LookupPermit)>,
     results: mpsc::Receiver<(u64, Outcome)>,
     pending: bool,
 }
@@ -46,13 +51,13 @@ impl Worker {
     fn new() -> Self {
         let revision = Arc::new(AtomicU64::new(1));
         let current = Arc::clone(&revision);
-        let (send, receive) = mpsc::channel::<(u64, Media)>();
+        let (send, receive) = mpsc::channel::<(u64, Media, LookupPermit)>();
         let (return_result, results) = mpsc::channel();
         thread::spawn(move || {
             let catalog = Catalog::new();
             while let Ok(first) = receive.recv() {
-                let (version, media) = receive.try_iter().last().unwrap_or(first);
-                let valid = || current.load(Ordering::Acquire) == version;
+                let (version, media, permit) = receive.try_iter().last().unwrap_or(first);
+                let valid = || current.load(Ordering::Acquire) == version && permit.valid();
                 if !valid() {
                     continue;
                 }
@@ -73,11 +78,15 @@ impl Worker {
         self.revision.fetch_add(1, Ordering::AcqRel);
         self.pending = false;
     }
-    fn request(&mut self, data: &Media) {
-        if !self.pending {
+    fn request(&mut self, lookup: &Media, permit: &LookupPermit) {
+        if !self.pending && permit.valid() {
             self.pending = self
                 .requests
-                .send((self.revision.load(Ordering::Acquire), data.clone()))
+                .send((
+                    self.revision.load(Ordering::Acquire),
+                    lookup.clone(),
+                    permit.clone(),
+                ))
                 .is_ok();
         }
     }
@@ -121,27 +130,11 @@ fn check() -> Result<(), String> {
         ),
         Err(_) => println!("音柱重连　暂时无法读取默认输出设备。"),
     }
-    let sessions = Sessions::open().map_err(|_| "无法读取 Windows 媒体会话。")?;
-    match sessions.current() {
-        Ok(Some(m)) => {
-            println!(
-                "Windows 媒体来源 {}　正在播放 {}　有进度 {}",
-                m.song.source.label(),
-                m.playing,
-                m.position.is_some()
-            );
-            println!(
-                "媒体封面 {}",
-                if sessions.cover(34).is_some() {
-                    "可用"
-                } else {
-                    "使用内置唱片"
-                }
-            );
-        }
-        Ok(None) => println!("Windows 当前没有播放或暂停的媒体会话。"),
-        Err(_) => return Err("无法读取 Windows 媒体会话。".into()),
-    }
+    let mut sessions = Sessions::open().map_err(|_| "无法读取 Windows 媒体会话。")?;
+    sessions
+        .current(false, None)
+        .map_err(|_| "无法读取 Windows 媒体会话。")?;
+    println!("当前媒体可逐首确认查词　{}", sessions.eligible);
     Ok(())
 }
 
@@ -153,12 +146,13 @@ fn core(bridge: &UiBridge) -> Result<(), String> {
     let mut audio = None;
     let mut poll_engine = Instant::now();
     let mut worker = Worker::new();
-    let mut cache = HashMap::<Song, CacheEntry>::new();
+    let mut cached: Option<CacheEntry> = None;
     let mut song = None;
     let mut sent: Option<Media> = None;
     let mut art = None;
     let mut art_key = None;
     let mut retry_art = Instant::now();
+    let mut offered = None;
     let mut last_track: Option<(Song, Instant)> = None;
     let mut notice_until = None;
     let mut scene = CapsuleData::default();
@@ -216,44 +210,67 @@ fn core(bridge: &UiBridge) -> Result<(), String> {
                 Ok(false) => {}
             }
         }
-        if sessions.is_none() {
+        if waiting.is_none() && sessions.is_none() {
             sessions = Sessions::open().ok();
         }
-        let Some(manager) = sessions.as_ref() else {
-            bridge.publish(idle("等待播放"));
-            thread::park_timeout(Duration::from_secs(2));
-            continue;
-        };
-        let current = match manager.current() {
-            Ok(m) => m,
-            Err(_) => {
+        let request = bridge.take_lookup_request();
+        let answer = bridge.take_lookup_answer();
+        let current = match sessions.as_mut() {
+            Some(manager) if waiting.is_none() => match manager.current(request, answer) {
+                Ok(m) => m,
+                Err(_) => {
+                    sessions = None;
+                    None
+                }
+            },
+            _ => {
                 sessions = None;
-                bridge.publish(idle("等待播放"));
-                thread::park_timeout(Duration::from_secs(1));
-                continue;
+                None
             }
         };
-        let Some(m) = current else {
+        let offer = sessions.as_ref().and_then(Sessions::offer);
+        if offer.as_ref().map(|(id, _)| *id) != offered {
+            offered = offer.as_ref().map(|(id, _)| *id);
+            bridge.offer_lookup_title(offer);
+        }
+        let Some(ApprovedTrack {
+            media: m,
+            permit,
+            id,
+            lookup_media,
+        }) = current.filter(|track| track.permit.valid())
+        else {
             if song.take().is_some() {
                 worker.cancel();
                 if let Some(engine) = &engine {
-                    for display in &screens {
-                        engine.send(display, "");
-                    }
+                    clear_automatic(engine, &screens, sent.as_ref());
                 }
                 sent = None;
             }
+            cached = None;
+            last_track = None;
+            notice_until = None;
             art = None;
             art_key = None;
-            bridge.publish(idle("等待播放"));
+            let mut snapshot = idle(
+                if sessions.as_ref().is_some_and(|manager| manager.eligible) {
+                    "右键可查本首歌词"
+                } else {
+                    "等待播放"
+                },
+            );
+            snapshot.media = sessions
+                .as_ref()
+                .and_then(|s| s.local_playing)
+                .map(Media::anonymous);
+            bridge.publish(snapshot);
             thread::park_timeout(Duration::from_millis(500));
             continue;
         };
-        if song.as_ref().is_none_or(|(previous, duration)| {
-            previous != &m.song || duration_changed(*duration, m.duration)
-        }) {
+        if lookup_changed(song, id, lookup_media.duration) {
             worker.cancel();
-            song = Some((m.song.clone(), m.duration));
+            song = Some((id, lookup_media.duration));
+            cached = None;
             sent = None;
         }
         if let Some((old, when)) = &last_track
@@ -265,7 +282,10 @@ fn core(bridge: &UiBridge) -> Result<(), String> {
         last_track = Some((m.song.clone(), now));
         let key = (m.song.clone(), bridge.desired_size());
         if art_key.as_ref() != Some(&key) || (art.is_none() && now >= retry_art) {
-            art = manager.cover(key.1).map(Arc::new);
+            art = sessions
+                .as_ref()
+                .and_then(|manager| manager.cover(key.1))
+                .map(Arc::new);
             art_key = Some(key);
             retry_art = now + Duration::from_secs(15);
         }
@@ -275,39 +295,22 @@ fn core(bridge: &UiBridge) -> Result<(), String> {
             }
             let seconds = match &result {
                 Outcome::Found(_) => 21600,
-                Outcome::Missing => 600,
+                Outcome::Ambiguous | Outcome::Missing => 600,
                 Outcome::Unavailable => 45,
             };
-            cache.retain(|_, entry| entry.until > now);
-            if cache.len() >= 64 {
-                if let Some(key) = cache
-                    .iter()
-                    .min_by_key(|(_, e)| e.until)
-                    .map(|(k, _)| k.clone())
-                {
-                    cache.remove(&key);
-                }
-            }
-            cache.insert(
-                m.song.clone(),
-                CacheEntry {
-                    until: now + Duration::from_secs(seconds),
-                    duration: m.duration,
-                    result,
-                },
-            );
+            cached = Some(CacheEntry {
+                until: now + Duration::from_secs(seconds),
+                result,
+            });
             sent = None;
         }
-        if cache
-            .get(&m.song)
-            .is_some_and(|e| e.until <= now || duration_changed(e.duration, m.duration))
-        {
-            cache.remove(&m.song);
+        if cached.as_ref().is_some_and(|e| e.until <= now) {
+            cached = None;
             sent = None;
         }
-        let entry = cache.get(&m.song);
+        let entry = cached.as_ref();
         if entry.is_none() && m.playing && waiting.is_none() {
-            worker.request(&m);
+            worker.request(&lookup_media, &permit);
         }
         let words = entry.and_then(|e| {
             if let Outcome::Found(w) = &e.result {
@@ -316,6 +319,9 @@ fn core(bridge: &UiBridge) -> Result<(), String> {
                 None
             }
         });
+        if !permit.valid() {
+            continue;
+        }
         let mut delivered = true;
         if let Some(engine) = &engine
             && !screens.is_empty()
@@ -323,6 +329,10 @@ fn core(bridge: &UiBridge) -> Result<(), String> {
         {
             let packet = protocol::build(&m, words);
             for display in &screens {
+                if !permit.valid() {
+                    delivered = false;
+                    break;
+                }
                 if !engine.send(display, &packet) {
                     delivered = false;
                 }
@@ -333,6 +343,9 @@ fn core(bridge: &UiBridge) -> Result<(), String> {
                 poll_engine = Instant::now();
             }
         }
+        if !permit.valid() {
+            continue;
+        }
         let state = if !delivered {
             "正在重连壁纸"
         } else if !m.playing {
@@ -340,6 +353,7 @@ fn core(bridge: &UiBridge) -> Result<(), String> {
         } else {
             match entry.map(|e| &e.result) {
                 Some(Outcome::Found(_)) => "歌词已同步",
+                Some(Outcome::Ambiguous) => "未确认歌曲版本",
                 Some(Outcome::Missing) => "没找到歌词",
                 Some(Outcome::Unavailable) => "查词服务忙",
                 None => "正在找歌词",
@@ -366,41 +380,44 @@ fn core(bridge: &UiBridge) -> Result<(), String> {
     }
     worker.cancel();
     if let Some(engine) = Engine::find() {
-        let displays = engine.displays();
-        if let Some(media) = sent.as_ref() {
-            let mut wait = false;
-            let packet = protocol::metadata_only(media);
-            for display in &displays {
-                if engine.in_playlist(display) {
-                    wait |= engine.send(display, &packet);
-                }
-            }
-            if wait {
-                thread::sleep(Duration::from_millis(420));
-            }
-        }
-        let mut cleared_displays = Vec::new();
-        for display in displays {
-            let mut cleared = engine.send(&display, "");
-            if !cleared && engine.displays().contains(&display) {
-                thread::sleep(Duration::from_millis(100));
-                cleared = engine.send(&display, "");
-            }
-            if cleared {
-                cleared_displays.push(display)
-            } else {
-                desktop::log("清空歌词时场景不可用");
-            }
-        }
-        let (count, retry) = engine.reload(&cleared_displays, ReloadReason::LyricsCleared);
-        if count > 0 {
-            desktop::log("已清空自动歌词并请求刷新当前场景");
-        }
-        if retry {
-            desktop::log("场景刷新命令未完成");
-        }
+        clear_automatic(&engine, &engine.displays(), sent.as_ref());
     }
     Ok(())
+}
+
+fn clear_automatic(engine: &Engine, displays: &[String], last: Option<&Media>) {
+    if let Some(media) = last {
+        let mut wait = false;
+        let packet = protocol::metadata_only(media);
+        for display in displays {
+            if engine.in_playlist(display) {
+                wait |= engine.send(display, &packet);
+            }
+        }
+        if wait {
+            thread::sleep(Duration::from_millis(420));
+        }
+    }
+    let mut cleared_displays = Vec::new();
+    for display in displays {
+        let mut cleared = engine.send(display, "");
+        if !cleared && engine.displays().contains(display) {
+            thread::sleep(Duration::from_millis(100));
+            cleared = engine.send(display, "");
+        }
+        if cleared {
+            cleared_displays.push(display.clone())
+        } else {
+            desktop::log("清空歌词时场景不可用");
+        }
+    }
+    let (count, retry) = engine.reload(&cleared_displays, ReloadReason::LyricsCleared);
+    if count > 0 {
+        desktop::log("已清空自动歌词并请求刷新当前场景");
+    }
+    if retry {
+        desktop::log("场景刷新命令未完成");
+    }
 }
 
 fn run() -> Result<(), String> {
@@ -486,6 +503,8 @@ mod tests {
         assert!(duration_changed(160.5, 204.133));
         assert!(!duration_changed(204.133, 204.18));
         assert!(!duration_changed(204.133, 0.0));
+        assert!(lookup_changed(Some((6, 204.133)), 7, 204.133));
+        assert!(!lookup_changed(Some((7, 204.133)), 7, 204.133));
     }
 
     #[test]
@@ -514,7 +533,7 @@ mod tests {
             song: Song {
                 title: "夜雨".into(),
                 artist: "演奏者".into(),
-                source: Source::Bilibili,
+                source: Source::Browser,
             },
             duration: 100.0,
             position: Some(40.0),
