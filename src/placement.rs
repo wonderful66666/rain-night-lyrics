@@ -1,9 +1,10 @@
 use crate::desktop::{UiSnapshot, data_dir};
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
     DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
@@ -34,6 +35,7 @@ pub struct CapsuleData {
     pub subtitle: String,
     pub notice: Option<(String, String)>,
     pub font: u8,
+    pub unknown_width: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +45,19 @@ pub struct Anchor {
     pub dpi: u32,
     pub hz: f64,
     pub key: String,
+    pub docked: bool,
+    pub animating: bool,
+    base: (i32, i32),
+    bounds: RECT,
+}
+
+impl Anchor {
+    pub fn constrain_drag(&self, (x, y): (i32, i32)) -> (i32, i32) {
+        (
+            x.clamp(self.bounds.left, self.bounds.right),
+            y.clamp(self.bounds.top, self.bounds.bottom),
+        )
+    }
 }
 
 struct Monitor {
@@ -371,37 +386,30 @@ struct Scene {
     half_view: f32,
 }
 
-fn project(rect: RECT, rows: bool, notice: bool) -> Scene {
+fn project(rect: RECT, height: f32, lift: f32) -> Scene {
     let w = (rect.right - rect.left) as f32;
     let h = (rect.bottom - rect.top) as f32;
     let projection = (w / 2560.0).max(h / 1600.0);
     let scale = projection * 1.5;
     let top_margin = (h / (2.0 * projection) - 670.0).max(46.0);
-    let lift = if notice { 42.0 } else { 0.0 };
     let clearance = (top_margin / 1.5 - 23.0).max(0.0);
     let rest_y = rect.top as f32 + projection * top_margin + scale * (lift - clearance).max(0.0);
     Scene {
         scale,
         home_x: rect.left as f32 + w / 2.0,
         rest_y,
-        middle_y: rest_y + scale * ((if rows { 10.0 } else { 0.0 }) - lift) * 0.5,
+        middle_y: rest_y + scale * (height - 36.0 - lift) * 0.5,
         half_view: w / (2.0 * scale),
     }
 }
 
-fn dodge_target(
-    scene: Scene,
-    width: f32,
-    rows: bool,
-    notice: bool,
-    current: f32,
-    cursor: POINT,
-) -> Option<f32> {
+fn dodge_target(scene: Scene, shape: &CapsuleShape, cursor: POINT) -> Option<f32> {
     let x = (cursor.x as f32 - scene.home_x) / scene.scale;
     let y = (cursor.y as f32 - scene.rest_y) / scene.scale;
-    let left = -width / 2.0 - 21.0;
-    let right = width / 2.0;
-    let near = y >= -52.0 - if notice { 42.0 } else { 0.0 } && y <= if rows { 62.0 } else { 52.0 };
+    let left = shape.satellite.position - 21.0;
+    let right = shape.right.position;
+    let current = shape.dodge.target;
+    let near = y >= -52.0 - shape.lift.position.max(0.0) && y <= shape.height.position + 16.0;
     if near && (left + current - 34.0..=right + current + 34.0).contains(&x) {
         let low = (-scene.half_view + 6.0 - left).clamp(-260.0, 0.0);
         let high = (scene.half_view - 6.0 - right).clamp(0.0, 260.0);
@@ -429,6 +437,168 @@ fn dodge_target(
     }
 }
 
+struct Spring {
+    position: f32,
+    target: f32,
+    velocity: f32,
+    direction: f32,
+}
+
+impl Spring {
+    fn new(position: f32) -> Self {
+        Self {
+            position,
+            target: position,
+            velocity: 0.0,
+            direction: 0.0,
+        }
+    }
+    fn aim(&mut self, target: f32) {
+        if self.target != target {
+            self.target = target;
+            self.direction = (target - self.position).signum();
+        }
+    }
+    fn active(&self) -> bool {
+        self.position != self.target || self.velocity != 0.0
+    }
+    fn step(&mut self, dt: f32, omega: f32, damping: f32, return_damping: f32) {
+        let delta = self.target - self.position;
+        if self.direction * delta < 0.0 {
+            self.direction = 0.0;
+        }
+        let damping = if self.direction == 0.0 {
+            return_damping
+        } else {
+            damping
+        };
+        self.velocity += (omega * omega * delta - 2.0 * damping * omega * self.velocity) * dt;
+        self.position += self.velocity * dt;
+        if delta.abs() < 0.009 && self.velocity.abs() < 0.04 {
+            self.position = self.target;
+            self.velocity = 0.0;
+        }
+    }
+}
+
+struct CapsuleShape {
+    right: Spring,
+    left: Spring,
+    satellite: Spring,
+    height: Spring,
+    lift: Spring,
+    dodge: Spring,
+    left_delay: f32,
+    clear_time: f32,
+}
+
+impl CapsuleShape {
+    fn new(width: f32, height: f32, lift: f32) -> Self {
+        Self {
+            right: Spring::new(width / 2.0),
+            left: Spring::new(-width / 2.0),
+            satellite: Spring::new(-width / 2.0),
+            height: Spring::new(height),
+            lift: Spring::new(lift),
+            dodge: Spring::new(0.0),
+            left_delay: 0.0,
+            clear_time: 0.0,
+        }
+    }
+    fn aim(&mut self, width: f32, height: f32, lift: f32) {
+        if self.right.target != width / 2.0 {
+            self.right.aim(width / 2.0);
+            self.left_delay = 0.070;
+        }
+        self.height.aim(height);
+        self.lift.aim(lift);
+    }
+    fn advance(&mut self, mut elapsed: f32) {
+        while elapsed > 0.0 {
+            let dt = elapsed.min(0.004);
+            elapsed -= dt;
+            if self.left_delay > 0.0 {
+                self.left_delay -= dt;
+                if self.left_delay <= 0.0 {
+                    self.left.aim(-self.right.target);
+                }
+            }
+            self.left.step(dt, 11.0, 1.0, 1.0);
+            self.right.step(dt, 11.0, 0.15, 0.85);
+            self.satellite.aim(self.left.position);
+            self.satellite.step(dt, 22.0, 1.0, 1.0);
+            if self.satellite.position > self.left.position {
+                self.satellite.position = self.left.position;
+                self.satellite.velocity = self.satellite.velocity.min(self.left.velocity);
+            }
+            for spring in [&mut self.height, &mut self.lift, &mut self.dodge] {
+                spring.step(dt, 210.0_f32.sqrt(), 0.72, 0.72);
+            }
+        }
+    }
+    fn active(&self) -> bool {
+        self.left_delay > 0.0
+            || self.right.active()
+            || self.left.active()
+            || self.satellite.active()
+            || self.dodge.active()
+            || self.lift.active()
+            || self.height.active()
+    }
+    fn follow_cursor(&mut self, target: Option<f32>, elapsed: f32) -> bool {
+        if let Some(target) = target {
+            self.dodge.aim(target);
+            self.clear_time = 0.0;
+        } else {
+            self.clear_time += elapsed;
+            if self.clear_time >= 0.45 {
+                self.dodge.aim(0.0);
+            }
+        }
+        target.is_none() && self.dodge.target != 0.0
+    }
+}
+
+fn dock_bounds(rect: RECT, dpi: u32, right: f32, middle_y: f32, bottom: f32) -> (RECT, (i32, i32)) {
+    let dip = dpi as f32 / 96.0;
+    let widget = disc_dpi(dpi) as f32 / 96.0;
+    let diameter = 44.0 * widget;
+    let gap = 10.0 * dip;
+    let max_x = (rect.right as f32 - diameter).floor().max(rect.left as f32) as i32;
+    let max_y = (rect.bottom as f32 - diameter).floor().max(rect.top as f32) as i32;
+    let right_anchor = (right + gap).ceil() as i32;
+    let card_max = (rect.right as f32 - 216.0 * widget).floor() as i32;
+    let below = right_anchor > card_max;
+    let min_x = if below {
+        rect.left
+    } else {
+        right_anchor.max(rect.left)
+    };
+    let min_y = if below {
+        ((bottom + gap).ceil() as i32).clamp(rect.top, max_y)
+    } else {
+        rect.top
+    };
+    let bounds = RECT {
+        left: min_x,
+        top: min_y,
+        right: card_max.clamp(min_x, max_x),
+        bottom: max_y,
+    };
+    let x = if below {
+        (right - diameter).round() as i32
+    } else {
+        right_anchor
+    };
+    (
+        bounds,
+        (
+            x.clamp(bounds.left, bounds.right),
+            ((middle_y - diameter / 2.0).round() as i32).clamp(min_y, max_y),
+        ),
+    )
+}
+
 pub struct Placement {
     monitors: Vec<Monitor>,
     offsets: BTreeMap<String, [f32; 2]>,
@@ -437,8 +607,9 @@ pub struct Placement {
     fonts_dir: Option<PathBuf>,
     font_collection: Option<IDWriteFontCollection>,
     cached: Option<(CapsuleData, f32)>,
-    dodge: f32,
-    last_near: Option<Instant>,
+    shape: CapsuleShape,
+    shape_monitor: Option<String>,
+    shape_time: Instant,
 }
 
 impl Placement {
@@ -448,9 +619,8 @@ impl Placement {
 
     fn with_dir(settings_dir: Option<PathBuf>) -> Self {
         let offsets = settings_dir
-            .as_ref()
-            .and_then(|dir| fs::read(dir.join("settings.json")).ok())
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .as_deref()
+            .map(crate::settings::offsets)
             .unwrap_or_default();
         Self {
             monitors: monitors(),
@@ -460,18 +630,24 @@ impl Placement {
             fonts_dir: None,
             font_collection: None,
             cached: None,
-            dodge: 0.0,
-            last_near: None,
+            shape: CapsuleShape::new(100.0, 36.0, 0.0),
+            shape_monitor: None,
+            shape_time: Instant::now(),
         }
     }
 
     pub fn invalidate(&mut self) {
         self.monitors = monitors();
-        self.dodge = 0.0;
-        self.last_near = None;
+        self.shape_monitor = None;
     }
 
     pub fn anchor(&mut self, snapshot: &UiSnapshot) -> Anchor {
+        let mut cursor = POINT::default();
+        let cursor = unsafe { GetCursorPos(&mut cursor) }.ok().map(|_| cursor);
+        self.anchor_at(snapshot, Instant::now(), cursor)
+    }
+
+    fn anchor_at(&mut self, snapshot: &UiSnapshot, now: Instant, cursor: Option<POINT>) -> Anchor {
         let data = &snapshot.placement;
         let index = data.display.as_deref().and_then(|id| {
             data.paths
@@ -485,7 +661,8 @@ impl Placement {
         let dip = dpi as f32 / 96.0;
         let widget_dip = disc_dpi(dpi) as f32 / 96.0;
         let rect = monitor.rect;
-        let (x, y) = if index.is_some() {
+        let mut animating = false;
+        let (bounds, base) = if index.is_some() {
             if self.cached.as_ref().is_none_or(|(key, _)| key != data) {
                 if data.font != 0 && self.fonts_dir != data.fonts {
                     self.font_collection = self
@@ -512,91 +689,104 @@ impl Placement {
                     .notice
                     .as_ref()
                     .map(|(label, song)| measure(label, 11.5).max(measure(song, 9.5)));
-                let width = capsule_width(
-                    measure(&data.title, 13.0),
-                    measure(&data.subtitle, 10.0),
-                    notice,
-                );
+                let width = if data.unknown_width {
+                    300.0_f32.max(notice.map_or(0.0, |_| 420.0))
+                } else {
+                    capsule_width(
+                        measure(&data.title, 13.0),
+                        measure(&data.subtitle, 10.0),
+                        notice,
+                    )
+                };
                 self.cached = Some((data.clone(), width));
             }
             let width = self.cached.as_ref().unwrap().1;
-            let rows = !data.subtitle.is_empty();
-            let notice = data.notice.is_some();
-            let scene = project(rect, rows, notice);
-            let now = Instant::now();
-            let mut cursor = POINT::default();
-            let target = unsafe { GetCursorPos(&mut cursor) }
-                .ok()
-                .and_then(|_| dodge_target(scene, width, rows, notice, self.dodge, cursor));
-            if let Some(target) = target {
-                self.dodge = target;
-                self.last_near = Some(now);
-            } else if self
-                .last_near
-                .is_none_or(|last| now.duration_since(last) >= Duration::from_millis(450))
-            {
-                self.dodge = 0.0;
+            let height = if data.subtitle.is_empty() { 36.0 } else { 46.0 };
+            let lift = if data.notice.is_some() { 42.0 } else { 0.0 };
+            let elapsed = now
+                .saturating_duration_since(self.shape_time)
+                .as_secs_f32()
+                .min(2.0);
+            self.shape_time = now;
+            if self.shape_monitor.as_ref() != Some(&monitor.key) {
+                self.shape = CapsuleShape::new(width, height, lift);
+                self.shape_monitor = Some(monitor.key.clone());
             }
-            (
-                scene.home_x + scene.scale * (width / 2.0 + self.dodge) + 10.0 * dip,
-                scene.middle_y - 22.0 * widget_dip,
-            )
+            if self.shape.active() {
+                self.shape.advance(elapsed);
+            }
+            self.shape.aim(width, height, lift);
+            let scene = project(rect, self.shape.height.position, self.shape.lift.position);
+            let target = cursor.and_then(|p| dodge_target(scene, &self.shape, p));
+            animating = self.shape.follow_cursor(target, elapsed) || self.shape.active();
+            let right = if data.unknown_width {
+                let widest = self.shape.right.position.max(self.shape.right.target);
+                let rebound = (widest - 50.0).max(0.0) * 0.32;
+                widest + rebound
+            } else {
+                self.shape.right.position
+            };
+            let edge = scene.home_x + scene.scale * (right + self.shape.dodge.position);
+            let bottom = scene.rest_y + scene.scale * (self.shape.height.position - 18.0 + 7.0);
+            dock_bounds(rect, dpi, edge, scene.middle_y, bottom)
         } else {
-            self.dodge = 0.0;
-            self.last_near = None;
+            self.shape_monitor = None;
+            let (max_x, max_y) = clamp_position(rect, widget_dip, f32::MAX, f32::MAX);
+            let bounds = RECT {
+                left: rect.left,
+                top: rect.top,
+                right: max_x,
+                bottom: max_y,
+            };
             (
-                (rect.left + rect.right) as f32 / 2.0 - 22.0 * widget_dip,
-                rect.top as f32 + 44.0 * dip,
+                bounds,
+                clamp_position(
+                    rect,
+                    widget_dip,
+                    (rect.left + rect.right) as f32 / 2.0 - 22.0 * widget_dip,
+                    rect.top as f32 + 44.0 * dip,
+                ),
             )
         };
         let key = monitor.key.clone();
         let [dx, dy] = self.offsets.get(&key).copied().unwrap_or_default();
-        let (x, y) = clamp_position(rect, widget_dip, x + dx * dip, y + dy * dip);
+        let x = ((base.0 as f32 + dx * dip).round() as i32).clamp(bounds.left, bounds.right);
+        let y = ((base.1 as f32 + dy * dip).round() as i32).clamp(bounds.top, bounds.bottom);
         Anchor {
             x,
             y,
             dpi,
             hz: monitor.hz,
             key,
+            docked: index.is_some(),
+            animating,
+            base,
+            bounds,
         }
     }
 
     pub fn drag(&mut self, anchor: &Anchor, dx: i32, dy: i32) {
         let dip = anchor.dpi as f32 / 96.0;
-        let (x, y) = (anchor.x.saturating_add(dx), anchor.y.saturating_add(dy));
-        let (x, y) = self
-            .monitors
-            .iter()
-            .find(|m| m.key == anchor.key)
-            .map_or((x, y), |m| {
-                clamp_position(
-                    m.rect,
-                    disc_dpi(anchor.dpi) as f32 / 96.0,
-                    x as f32,
-                    y as f32,
-                )
-            });
-        let offset = self.offsets.entry(anchor.key.clone()).or_default();
-        offset[0] += (x - anchor.x) as f32 / dip;
-        offset[1] += (y - anchor.y) as f32 / dip;
-        self.save();
+        let (x, y) =
+            anchor.constrain_drag((anchor.x.saturating_add(dx), anchor.y.saturating_add(dy)));
+        self.offsets.insert(
+            anchor.key.clone(),
+            [
+                (x - anchor.base.0) as f32 / dip,
+                (y - anchor.base.1) as f32 / dip,
+            ],
+        );
+        self.save(&anchor.key);
     }
 
     pub fn reset(&mut self, anchor: &Anchor) {
         self.offsets.remove(&anchor.key);
-        self.save();
+        self.save(&anchor.key);
     }
 
-    fn save(&self) {
-        let (Some(dir), Ok(bytes)) = (&self.settings_dir, serde_json::to_vec(&self.offsets)) else {
-            return;
-        };
-        if fs::create_dir_all(dir).is_err() {
-            return;
-        }
-        let temp = dir.join("settings.tmp");
-        if fs::write(&temp, bytes).is_ok() {
-            let _ = fs::rename(temp, dir.join("settings.json"));
+    fn save(&self, key: &str) {
+        if let Some(dir) = &self.settings_dir {
+            let _ = crate::settings::set_offset(dir, key, self.offsets.get(key).copied());
         }
     }
 }
@@ -619,6 +809,7 @@ fn clamp_position(rect: RECT, dip: f32, x: f32, y: f32) -> (i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn fallback_drag_and_reset_survive_restarting_on_a_scaled_primary_monitor() {
@@ -684,12 +875,12 @@ mod tests {
             right: 0,
             bottom: 1080,
         };
-        let scene = project(rect, false, false);
+        let scene = project(rect, 36.0, 0.0);
         assert_eq!(
             (scene.home_x, scene.middle_y, scene.scale),
             (-960., 37.5, 1.125)
         );
-        let two = project(rect, true, false);
+        let two = project(rect, 46.0, 0.0);
         assert_eq!(two.middle_y, 37.5 + 5. * 1.125);
         for dpi in [96, 120, 144] {
             let dip = disc_dpi(dpi) as f32 / 96.;
@@ -706,8 +897,8 @@ mod tests {
                 right: 3840,
                 bottom: 1080,
             },
-            false,
-            false,
+            36.0,
+            0.0,
         );
         assert_eq!(wide.rest_y, 69.);
     }
@@ -721,16 +912,117 @@ mod tests {
                 right: 2560,
                 bottom: 1600,
             },
-            false,
-            false,
+            36.0,
+            0.0,
         );
         let at = |x, y| POINT { x, y };
-        assert!(dodge_target(scene, 150., false, false, 0., at(1260, 130)).unwrap() > 0.);
-        assert!(dodge_target(scene, 150., false, false, 0., at(1300, 130)).unwrap() < 0.);
-        assert_eq!(
-            dodge_target(scene, 150., false, false, 70., at(1300, 450)),
-            None
-        );
+        let mut shape = CapsuleShape::new(150., 36., 0.);
+        assert!(dodge_target(scene, &shape, at(1260, 130)).unwrap() > 0.);
+        assert!(dodge_target(scene, &shape, at(1300, 130)).unwrap() < 0.);
+        shape.dodge.aim(70.);
+        assert_eq!(dodge_target(scene, &shape, at(1300, 450)), None);
+        assert!(shape.follow_cursor(None, 0.4));
+        assert!(!shape.follow_cursor(None, 0.06));
+        assert_eq!(shape.dodge.target, 0.0);
+    }
+
+    #[test]
+    fn disc_clears_the_scene_spring_peak_with_an_old_negative_drag_offset() {
+        for hz in [60, 240] {
+            let mut placement = Placement::with_dir(None);
+            placement.monitors[0].rect = RECT {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1600,
+            };
+            placement.monitors[0].dpi = 144;
+            let key = placement.monitors[0].key.clone();
+            placement.offsets.insert(key, [-60., 0.]);
+            let mut view = UiSnapshot::default();
+            view.placement.display = Some("Monitor0".into());
+            let mut now = Instant::now();
+            let frame = Duration::from_nanos(1_000_000_000 / hz);
+            let first = placement.anchor_at(&view, now, None);
+            assert_eq!(first.x, 1370);
+            let long = "很长的测试内容".repeat(16);
+            let mut scene_edge = 50.0_f64;
+            let mut scene_rate = 0.0_f64;
+            let mut previous_x = first.x;
+            for (title, subtitle, notice, target) in [
+                (long.as_str(), "", false, 150.0_f64),
+                ("", "", false, 50.0),
+                ("", long.as_str(), false, 150.0),
+                ("", long.as_str(), true, 210.0),
+                ("", long.as_str(), false, 150.0),
+            ] {
+                view.placement.title = title.into();
+                view.placement.subtitle = subtitle.into();
+                view.placement.notice = notice.then(|| ("提示".into(), long.clone()));
+                let change = placement.anchor_at(&view, now, None);
+                assert_eq!(change.x, previous_x);
+                assert!(change.docked && change.animating);
+                let mut direction = (target - scene_edge).signum();
+                let mut peak = scene_edge;
+                for _ in 0..2 * hz {
+                    let mut remaining = frame.as_secs_f64();
+                    while remaining > 0.0 {
+                        let dt = remaining.min(0.004);
+                        remaining -= dt;
+                        let delta = target - scene_edge;
+                        if direction * delta < 0.0 {
+                            direction = 0.0;
+                        }
+                        let damping = if direction == 0.0 { 0.85 } else { 0.15 };
+                        scene_rate += (121.0 * delta - 22.0 * damping * scene_rate) * dt;
+                        scene_edge += scene_rate * dt;
+                        if delta.abs() < 0.009 && scene_rate.abs() < 0.04 {
+                            scene_edge = target;
+                            scene_rate = 0.0;
+                        }
+                    }
+                    peak = peak.max(scene_edge);
+                    now += frame;
+                    let a = placement.anchor_at(&view, now, None);
+                    let gap = f64::from(a.x) - (1280.0 + 1.5 * scene_edge);
+                    assert!((14.999..=16.001).contains(&gap), "{hz} Hz: {gap} px");
+                    assert_eq!(a.constrain_drag((0, a.y)).0, a.x);
+                    previous_x = a.x;
+                }
+                if !title.is_empty() {
+                    assert!((178.0..181.0).contains(&peak));
+                }
+                assert_eq!(previous_x, (1280.0 + 1.5 * target + 15.0) as i32);
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_width_and_narrow_monitor_keep_the_folded_disc_outside() {
+        let mut placement = Placement::with_dir(None);
+        let rect = RECT {
+            left: -1920,
+            top: -160,
+            right: 0,
+            bottom: 920,
+        };
+        placement.monitors[0].rect = rect;
+        placement.monitors[0].dpi = 96;
+        let mut view = UiSnapshot::default();
+        view.placement.display = Some("Monitor0".into());
+        view.placement.unknown_width = true;
+        let first = placement.anchor_at(&view, Instant::now(), None);
+        assert_eq!(first.x, (-960.0_f32 + 1.125 * 182.0 + 10.0).ceil() as i32);
+        view.placement.notice = Some(("提示".into(), String::new()));
+        let notice = placement.anchor_at(&view, Instant::now(), None);
+        assert_eq!(notice.x, (-960.0_f32 + 1.125 * 261.2 + 10.0).ceil() as i32);
+        let (bounds, base) = dock_bounds(rect, 144, -20.0, 0.0, 46.0);
+        assert!(base.1 >= 61 && bounds.top >= 61);
+        assert!(base.0 >= rect.left && base.0 + 54 <= rect.right);
+        let (bounds, base) = dock_bounds(rect, 144, -120.0, 0.0, 46.0);
+        assert!(base.1 >= 61 && bounds.top >= 61);
+        let panel = 216.0 * disc_dpi(144) as f32 / 96.0;
+        assert!(base.0 as f32 + panel <= rect.right as f32);
     }
 
     #[test]

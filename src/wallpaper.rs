@@ -186,6 +186,127 @@ fn engine_in_dir(exe: &Path, dir: &Path) -> bool {
         })
 }
 
+fn read_local(path: &Path, limit: u64) -> Option<Vec<u8>> {
+    if !local_unlinked(path) {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    let info = file.metadata().ok()?;
+    if !info.is_file() || info.len() > limit {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 <= limit).then_some(bytes)
+}
+
+#[derive(PartialEq)]
+enum VdfToken {
+    Word(String),
+    Open,
+    Close,
+}
+
+fn vdf_token(input: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<Option<VdfToken>, ()> {
+    while let Some(ch) = input.next() {
+        match ch {
+            c if c.is_whitespace() => continue,
+            '/' if input.next_if_eq(&'/').is_some() => {
+                for next in input.by_ref() {
+                    if next == '\n' {
+                        break;
+                    }
+                }
+            }
+            '{' => return Ok(Some(VdfToken::Open)),
+            '}' => return Ok(Some(VdfToken::Close)),
+            '"' => {
+                let mut value = String::new();
+                while let Some(next) = input.next() {
+                    match next {
+                        '"' => return Ok(Some(VdfToken::Word(value))),
+                        '\\' if matches!(input.peek(), Some('"' | '\\')) => {
+                            value.push(input.next().unwrap())
+                        }
+                        _ => value.push(next),
+                    }
+                }
+                return Err(());
+            }
+            _ => {
+                let mut word = String::from(ch);
+                while let Some(c) =
+                    input.next_if(|c| !c.is_whitespace() && !matches!(c, '{' | '}' | '"'))
+                {
+                    word.push(c);
+                }
+                return Ok(Some(VdfToken::Word(word)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn steam_libraries(text: &str) -> Option<Vec<PathBuf>> {
+    let mut input = text.trim_start_matches('\u{feff}').chars().peekable();
+    let VdfToken::Word(root) = vdf_token(&mut input).ok()?? else {
+        return None;
+    };
+    if !root.eq_ignore_ascii_case("libraryfolders")
+        || vdf_token(&mut input).ok()?? != VdfToken::Open
+    {
+        return None;
+    }
+    let mut depth = 1u8;
+    let mut library = false;
+    let mut roots = Vec::new();
+    while depth != 0 {
+        let key = match vdf_token(&mut input).ok()?? {
+            VdfToken::Word(word) => word,
+            VdfToken::Close => {
+                depth -= 1;
+                continue;
+            }
+            VdfToken::Open => return None,
+        };
+        let numbered = !key.is_empty() && key.bytes().all(|c| c.is_ascii_digit());
+        match vdf_token(&mut input).ok()?? {
+            VdfToken::Open if depth < 32 => {
+                if depth == 1 {
+                    library = numbered;
+                }
+                depth += 1;
+            }
+            VdfToken::Word(value) => {
+                if ((depth == 1 && numbered)
+                    || (depth == 2 && library && key.eq_ignore_ascii_case("path")))
+                    && value.len() <= 32_767
+                    && !value.chars().any(char::is_control)
+                    && disk_letter(Path::new(&value)).is_some()
+                {
+                    roots.push(PathBuf::from(value));
+                }
+            }
+            _ => return None,
+        }
+    }
+    vdf_token(&mut input).ok()?.is_none().then_some(roots)
+}
+
+fn engine_in_steam_library(exe: &Path, steam: &Path) -> bool {
+    let relative = "steamapps/common/wallpaper_engine";
+    if engine_in_dir(exe, &steam.join(relative)) {
+        return true;
+    }
+    read_local(&steam.join("steamapps/libraryfolders.vdf"), 1024 * 1024)
+        .and_then(|bytes| steam_libraries(std::str::from_utf8(&bytes).ok()?))
+        .is_some_and(|libraries| {
+            libraries
+                .iter()
+                .any(|dir| engine_in_dir(exe, &dir.join(relative)))
+        })
+}
+
 fn is_installed_engine(exe: &Path) -> bool {
     [RRF_SUBKEY_WOW6464KEY, RRF_SUBKEY_WOW6432KEY]
         .into_iter()
@@ -195,12 +316,9 @@ fn is_installed_engine(exe: &Path) -> bool {
                 w!("InstallLocation"),
                 view,
             );
-            let steam = || {
-                registered_dir(w!("SOFTWARE\\Valve\\Steam"), w!("InstallPath"), view)
-                    .map(|p| p.join("steamapps/common/wallpaper_engine"))
-            };
             app.is_some_and(|dir| engine_in_dir(exe, &dir))
-                || steam().is_some_and(|dir| engine_in_dir(exe, &dir))
+                || registered_dir(w!("SOFTWARE\\Valve\\Steam"), w!("InstallPath"), view)
+                    .is_some_and(|steam| engine_in_steam_library(exe, &steam))
         })
 }
 
@@ -339,6 +457,20 @@ fn is_ours(file: &str) -> bool {
         && parts[1..] == [WORKSHOP_ID, "431960", "content", "workshop", "steamapps"]
 }
 
+fn handles_lyric_clear(file: &str) -> bool {
+    if !is_ours(file) || !local_unlinked(Path::new(file)) {
+        return false;
+    }
+    let path = Path::new(file).with_file_name("project.json");
+    read_local(&path, 1024 * 1024).is_some_and(|bytes| {
+        let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+        serde_json::from_slice::<Value>(bytes)
+            .ok()
+            .and_then(|v| v.get("capsuleprotocol")?.as_u64())
+            .is_some_and(|v| v >= 2)
+    })
+}
+
 fn user_settings<'a>(config: &'a Value, user: &str) -> Option<&'a Value> {
     config
         .as_object()
@@ -451,18 +583,7 @@ impl Engine {
     fn config(&self) -> Option<Value> {
         const MAX_BYTES: u64 = 32 * 1024 * 1024;
         let path = self.exe.with_file_name("config.json");
-        if !local_unlinked(&path) {
-            return None;
-        }
-        let file = fs::File::open(path).ok()?;
-        if file.metadata().ok()?.len() > MAX_BYTES {
-            return None;
-        }
-        let mut bytes = Vec::new();
-        file.take(MAX_BYTES + 1).read_to_end(&mut bytes).ok()?;
-        if bytes.len() as u64 > MAX_BYTES {
-            return None;
-        }
+        let bytes = read_local(&path, MAX_BYTES)?;
         let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
         serde_json::from_slice(bytes).ok()
     }
@@ -525,6 +646,10 @@ impl Engine {
                 .unwrap_or(0)
         };
         data.font = number("capsulefont").clamp(0, 2) as u8;
+        data.unknown_width = props
+            .and_then(|p| p.get("capsulelyrics"))
+            .and_then(|v| v.get("value").unwrap_or(v).as_str())
+            .is_some_and(|s| !s.trim().is_empty());
         (
             screens,
             data,
@@ -539,6 +664,17 @@ impl Engine {
                 .and_then(|s| s.pointer("/wallpaperconfig/selectedwallpapers"))
                 .and_then(|v| v.get(display))
                 .is_some_and(in_playlist)
+        })
+    }
+    pub fn handles_lyric_clear(&self, display: &str) -> bool {
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        self.config().is_some_and(|cfg| {
+            user_settings(&cfg, &user)
+                .and_then(|entry| entry.pointer("/wallpaperconfig/selectedwallpapers"))
+                .and_then(|monitors| monitors.get(display))
+                .and_then(|entry| entry.get("file"))
+                .and_then(Value::as_str)
+                .is_some_and(handles_lyric_clear)
         })
     }
     pub fn reload(&self, displays: &[String], reason: ReloadReason) -> (usize, bool) {
@@ -556,6 +692,9 @@ impl Engine {
             let Some((file, preset)) = reload_target(&config, &user, display, reason) else {
                 continue;
             };
+            if reason == ReloadReason::LyricsCleared && handles_lyric_clear(file) {
+                continue;
+            }
             if !local_unlinked(Path::new(file)) || !Path::new(file).is_file() {
                 continue;
             }
@@ -642,6 +781,103 @@ impl Engine {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn vdf_accepts_numbered_legacy_and_current_libraries_only() {
+        let libraries = steam_libraries(
+            r#"// Steam libraries
+            "LibraryFolders" {
+              "0" "Q:\\Games"
+              "1" { "path" "P:\\Library with space" "apps" { "path" "X:\\Nested" } }
+              "2" { "path" "M:\Single Slash" }
+              "extra" { "path" "Y:\\Metadata" }
+              "3" { "path" "\\\\server\\share" }
+              "4" { "path" "R:\\Games\\..\\temp" }
+              "5" { "path" "relativePath" }
+            }
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            libraries,
+            [r"Q:\Games", r"P:\Library with space", r"M:\Single Slash"].map(PathBuf::from)
+        );
+        assert!(steam_libraries(r#""libraryfolders" { "0" { "path" "P:\\truncated" }"#).is_none());
+        assert!(steam_libraries(r#""other" {"0" "P:\\unrelated"}"#).is_none());
+        assert!(steam_libraries(r#""libraryfolders" {} trailing"#).is_none());
+        let deeply_nested = format!(
+            "libraryfolders {{ {} {} }}",
+            "x {".repeat(40),
+            "}".repeat(40)
+        );
+        assert!(steam_libraries(&deeply_nested).is_none());
+    }
+
+    #[test]
+    fn secondary_steam_library_and_versioned_subscription_use_their_own_manifests() {
+        let root = std::env::temp_dir().join(format!(
+            "rain-night-library-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let steam = root.join("Steam");
+        let second = root.join("Library");
+        let sub = second
+            .join("steamapps/workshop/content/431960")
+            .join(WORKSHOP_ID);
+        fs::create_dir_all(steam.join("steamapps")).unwrap();
+        fs::create_dir_all(&sub).unwrap();
+        let vdf_path = steam.join("steamapps/libraryfolders.vdf");
+        let executable = second.join("steamapps/common/wallpaper_engine/wallpaper64.exe");
+        assert!(!engine_in_steam_library(&executable, &steam));
+        let escaped = second.to_str().unwrap().replace('\\', "\\\\");
+        fs::write(
+            &vdf_path,
+            format!(r#""libraryfolders" {{ "1" {{ "path" "{escaped}" }} }}"#),
+        )
+        .unwrap();
+        assert!(engine_in_steam_library(&executable, &steam));
+        assert!(!engine_in_steam_library(
+            &executable.with_file_name("other.exe"),
+            &steam
+        ));
+        fs::write(&vdf_path, vec![b' '; 1024 * 1024 + 1]).unwrap();
+        assert!(!engine_in_steam_library(&executable, &steam));
+        let scene = sub.join("scene.pkg");
+        let project = sub.join("project.json");
+        fs::write(&scene, b"").unwrap();
+        let file = scene.to_str().unwrap();
+        assert!(!handles_lyric_clear(file));
+        for text in [
+            "{}",
+            r#"{"capsuleprotocol":1}"#,
+            r#"{"capsuleprotocol":"2"}"#,
+            r#"{"general":{"properties":{"capsuleprotocol":{"value":2}}}}"#,
+            "invalid",
+        ] {
+            fs::write(&project, text).unwrap();
+            assert!(!handles_lyric_clear(file));
+        }
+        for text in [
+            r#"{"capsuleprotocol":2}"#,
+            "\u{feff}{\"capsuleprotocol\":3}",
+        ] {
+            fs::write(&project, text).unwrap();
+            assert!(handles_lyric_clear(file));
+            assert!(handles_lyric_clear(project.to_str().unwrap()));
+        }
+        let mut oversize = br#"{"capsuleprotocol":2}"#.to_vec();
+        oversize.resize(1024 * 1024 + 1, b' ');
+        fs::write(&project, oversize).unwrap();
+        assert!(!handles_lyric_clear(file));
+        assert!(!handles_lyric_clear(
+            steam.join("scene.pkg").to_str().unwrap()
+        ));
+        fs::remove_dir_all(&root).unwrap();
+    }
     #[test]
     fn engine_identity_requires_exact_registered_directory_and_local_drive() {
         let installed = Path::new(r"Q:\My Library\steamapps\common\wallpaper_engine");

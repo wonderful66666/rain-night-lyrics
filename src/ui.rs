@@ -1,6 +1,6 @@
 use crate::animation::{self, Anim};
-use crate::desktop::{DISMISS_LOOKUP, LOOKUP_OFFER, UiBridge, UiSnapshot};
-use crate::lookup_dialog::LookupDialog;
+use crate::desktop::{ASK_AUTO, DISMISS_LOOKUP, LOOKUP_OFFER, UiBridge, UiSnapshot};
+use crate::lookup_dialog::{LookupDialog, save_choice};
 use crate::placement::{Anchor, Placement, disc_dpi};
 use crate::render::{CANVAS, Frame, Renderer};
 use std::cell::Cell;
@@ -31,6 +31,7 @@ const CLOSE: u32 = WM_APP + 6;
 const MENU_WAKE: usize = 1;
 const TARGET_HZ: PCWSTR = w!("RainNightDisc.TargetMilliHz");
 const DRAW_HZ: PCWSTR = w!("RainNightDisc.DrawMilliHz");
+const PLAYBACK_DRAWING: PCWSTR = w!("RainNightDisc.PlaybackDrawing");
 const LEAVE: u32 = 0x02a3;
 const LEFT: f64 = 40.0;
 const TOP: f64 = 24.0;
@@ -253,6 +254,20 @@ struct Meter {
     start: Option<f64>,
     frames: u32,
 }
+
+#[derive(Default)]
+struct SteadyFrames {
+    last: Option<(f64, u64)>,
+}
+
+impl SteadyFrames {
+    fn allow(&mut self, now: f64, rate: Option<f64>) -> bool {
+        let slot = rate.map(|hz| (hz, (now * hz).floor() as u64));
+        let draw = slot.is_none() || self.last != slot;
+        self.last = slot;
+        draw
+    }
+}
 impl Meter {
     fn tick(&mut self, hwnd: HWND, now: f64, hz: f64, running: bool, painted: bool) {
         let publish = |key, value: f64| unsafe {
@@ -324,6 +339,15 @@ struct Move {
     since: f64,
 }
 impl Move {
+    fn follow(&mut self, to: (i32, i32), t: f64, immediate: bool) -> bool {
+        if self.to == to && (!immediate || self.from == to) {
+            return false;
+        }
+        let from = if immediate { to } else { self.at(t) };
+        *self = Self { from, to, since: t };
+        true
+    }
+
     fn at(&self, t: f64) -> (i32, i32) {
         if self.from == self.to {
             return self.to;
@@ -344,6 +368,19 @@ struct Press {
     dragged: bool,
 }
 
+impl Press {
+    fn position(&self, anchor: &Anchor) -> (i32, i32) {
+        anchor.constrain_drag((
+            self.original.0.saturating_add(self.offset.0),
+            self.original.1.saturating_add(self.offset.1),
+        ))
+    }
+
+    fn released_part(&self, part: Part, point: (i32, i32), docked: bool) -> Option<Part> {
+        (part == self.part || (docked && point == self.cursor)).then_some(self.part)
+    }
+}
+
 struct Overlay {
     window: HWND,
     view: UiSnapshot,
@@ -361,26 +398,19 @@ struct Overlay {
     sampled: f64,
 }
 impl Overlay {
-    fn layout(&mut self, t: f64, force: bool) {
-        if self.press.is_some() || (!force && self.anim.hovered) {
-            return;
-        }
+    fn layout(&mut self, t: f64) -> bool {
         let next = self.placement.anchor(&self.view);
-        let to = (next.x, next.y);
-        if self.motion.to != to || next.dpi != self.anchor.dpi {
-            let from = if self.anim.reduced
-                || next.key != self.anchor.key
-                || next.dpi != self.anchor.dpi
-            {
-                to
-            } else {
-                self.motion.at(t)
-            };
-            self.motion = Move { from, to, since: t };
-        }
+        let dpi_changed = next.dpi != self.anchor.dpi;
+        let immediate = next.docked
+            || self.anchor.docked
+            || dpi_changed
+            || next.key != self.anchor.key
+            || self.anim.reduced;
+        let moved = self.motion.follow((next.x, next.y), t, immediate);
         self.bridge
             .cover_size(pixel(34.0, disc_dpi(next.dpi)).max(1) as u32);
         self.anchor = next;
+        moved || dpi_changed
     }
     fn sync_clock(&mut self, t: f64) {
         self.sampled = t;
@@ -392,6 +422,7 @@ impl Overlay {
     fn snapshot(&mut self, t: f64) -> bool {
         let new = self.bridge.latest();
         let changed = self.view.status != new.status
+            || self.view.placement != new.placement
             || match (&self.view.cover, &new.cover) {
                 (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
                 (None, None) => false,
@@ -412,17 +443,19 @@ impl Overlay {
         let playing = self.view.media.as_ref().is_some_and(|m| m.playing);
         self.anim.playback(playing, t);
         self.sync_clock(t);
-        let old = (self.motion.to, self.anchor.dpi);
-        self.layout(t, false);
-        changed || old != (self.motion.to, self.anchor.dpi)
+        changed
     }
     fn draw(&mut self, t: f64) -> Result<()> {
-        let p = self.anim.pose(t);
+        let mut p = self.anim.pose(t);
+        if self.anchor.docked {
+            p.keep_dock_clearance();
+        }
         let dpi = disc_dpi(self.anchor.dpi);
-        let circle = self.press.as_ref().filter(|p| p.dragged).map_or_else(
-            || self.motion.at(t),
-            |p| (p.original.0 + p.offset.0, p.original.1 + p.offset.1),
-        );
+        let circle = self
+            .press
+            .as_ref()
+            .filter(|p| p.dragged)
+            .map_or_else(|| self.motion.at(t), |p| p.position(&self.anchor));
         self.origin = (circle.0 - pixel(LEFT, dpi), circle.1 - pixel(TOP, dpi));
         let playing = self.view.media.as_ref().is_some_and(|m| m.playing);
         let progress = self
@@ -483,12 +516,20 @@ impl Overlay {
                 return;
             };
             let opened = Instant::now();
-            let lookup = if self.view.media.is_some() {
+            let is_auto = self.bridge.auto_policy().0 == Some(true);
+            let auto = if is_auto {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            };
+            let lookup = if self.bridge.can_request_lookup() {
                 MF_STRING
             } else {
                 MF_STRING | MF_GRAYED
             };
-            let _ = AppendMenuW(menu, lookup, 3, w!("为当前媒体查一次歌词…"));
+            let _ = AppendMenuW(menu, auto, 4, w!("自动查词（音乐软件）"));
+            let _ = AppendMenuW(menu, lookup, 3, w!("为当前播放查一次歌词…"));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, 1, w!("回到默认位置"));
             let _ = AppendMenuW(menu, MF_STRING, 2, w!("关闭取词器"));
             let selected = self.select_menu(menu, point);
@@ -496,13 +537,16 @@ impl Overlay {
             self.snapshot(t);
             if selected == 1 {
                 self.placement.reset(&self.anchor);
-                self.layout(t, true);
+                self.layout(t);
             }
             if selected == 2 {
                 self.anim.close(t);
             }
-            if selected == 3 {
+            if selected == 3 && self.bridge.can_request_lookup() {
                 self.bridge.request_lookup();
+            }
+            if selected == 4 {
+                save_choice(self.window, &self.bridge, !is_auto);
             }
         }
     }
@@ -577,19 +621,20 @@ impl Overlay {
                 }
                 if let Some(press) = press {
                     if press.dragged {
-                        self.placement
-                            .drag(&self.anchor, press.offset.0, press.offset.1);
-                        let pos = (
-                            press.original.0 + press.offset.0,
-                            press.original.1 + press.offset.1,
+                        let pos = press.position(&self.anchor);
+                        self.placement.drag(
+                            &self.anchor,
+                            pos.0.saturating_sub(self.anchor.x),
+                            pos.1.saturating_sub(self.anchor.y),
                         );
                         self.motion = Move {
                             from: pos,
                             to: pos,
                             since: t,
                         };
-                        self.layout(t, true);
-                    } else if part == press.part {
+                        self.layout(t);
+                    } else if let Some(part) = press.released_part(part, point, self.anchor.docked)
+                    {
                         if self.anim.expanded && part == Part::Close {
                             self.anim.close(t);
                         } else if part == Part::Disc {
@@ -623,6 +668,7 @@ impl Drop for Resources {
             if !self.window.is_invalid() {
                 let _ = RemovePropW(self.window, TARGET_HZ);
                 let _ = RemovePropW(self.window, DRAW_HZ);
+                let _ = RemovePropW(self.window, PLAYBACK_DRAWING);
                 let _ = DestroyWindow(self.window);
             }
             if !self.previous_dpi.is_invalid() {
@@ -644,6 +690,12 @@ pub fn run(bridge: Arc<UiBridge>, stop: HANDLE, show: HANDLE) -> Result<()> {
         },
     };
     let class = w!("RainNightLyrics.DesktopDisc");
+    #[cfg(test)]
+    let class = if tests::fixture_active() {
+        w!("RainNightLyrics.TestDisc")
+    } else {
+        class
+    };
     let module = unsafe { GetModuleHandleW(None)? };
     let instance = HINSTANCE(module.0);
     let wc = WNDCLASSW {
@@ -737,6 +789,8 @@ pub fn run(bridge: Arc<UiBridge>, stop: HANDLE, show: HANDLE) -> Result<()> {
     let mut dirty = true;
     let mut timer = DeadlineTimer::new()?;
     let mut meter = Meter::default();
+    let mut steady_frames = SteadyFrames::default();
+    let mut playback_drawing = 0;
     let mut obscured = covered(hwnd, app.origin, disc_dpi(app.anchor.dpi));
     loop {
         let t = start.elapsed().as_secs_f64();
@@ -761,17 +815,45 @@ pub fn run(bridge: Arc<UiBridge>, stop: HANDLE, show: HANDLE) -> Result<()> {
             app.was_down = down;
         }
         if dirty && !obscured {
-            app.layout(t, false);
+            app.layout(t);
+        }
+        let hz = app.anchor.hz;
+        let moving = app.anchor.animating
+            || (app.motion.from != app.motion.to && t - app.motion.since < 0.220);
+        let paint_hz = if obscured {
+            None
+        } else {
+            app.anim.frame_rate(t, app.view.media.is_some(), moving, hz)
+        };
+        let animating = paint_hz.is_some();
+        let drawing = if obscured || !app.view.media.as_ref().is_some_and(|m| m.playing) {
+            0
+        } else if !moving && !app.anim.reduced && paint_hz == Some(hz.min(60.0)) {
+            1
+        } else {
+            2
+        };
+        if drawing != playback_drawing {
+            playback_drawing = drawing;
+            unsafe {
+                if drawing != 0 {
+                    let _ = SetPropW(hwnd, PLAYBACK_DRAWING, HANDLE(drawing as *mut _));
+                } else {
+                    let _ = RemovePropW(hwnd, PLAYBACK_DRAWING);
+                }
+            }
+        }
+        let painted = dirty
+            && !obscured
+            && steady_frames.allow(t, if drawing == 1 { paint_hz } else { None });
+        if painted {
             app.draw(t)?;
         }
         let now = start.elapsed().as_secs_f64();
-        let hz = app.anchor.hz;
-        let moving = app.motion.from != app.motion.to && t - app.motion.since < 0.220;
-        let animating = !obscured && (moving || app.anim.animating(t, app.view.media.is_some()));
-        meter.tick(hwnd, now, hz, animating, dirty && !obscured);
+        meter.tick(hwnd, now, hz, animating, painted);
         dirty = false;
-        let paint_at = if animating {
-            Some(animation::next_frame(now, hz))
+        let paint_at = if let Some(rate) = paint_hz {
+            Some(animation::next_frame(now, rate))
         } else if obscured {
             None
         } else if app.anim.reduced
@@ -791,7 +873,9 @@ pub fn run(bridge: Arc<UiBridge>, stop: HANDLE, show: HANDLE) -> Result<()> {
             .anim
             .closing
             .map(|at| at + if app.anim.reduced { 0.2 } else { 1.3 });
-        let deadline = [paint_at, outside_at, app.anim.collapse_at, finish]
+        let track_at = (app.anchor.docked && !animating && !obscured)
+            .then(|| animation::next_frame(now, 30.0));
+        let deadline = [paint_at, track_at, outside_at, app.anim.collapse_at, finish]
             .into_iter()
             .flatten()
             .min_by(f64::total_cmp);
@@ -799,6 +883,29 @@ pub fn run(bridge: Arc<UiBridge>, stop: HANDLE, show: HANDLE) -> Result<()> {
         let closing = app.anim.closing.is_some();
         if closing || lookup.as_ref().is_some_and(|d| !d.current()) {
             lookup = None;
+        }
+        if !closing && lookup.is_none() {
+            if app.bridge.ask_auto_pending() {
+                app.anim.reveal(t);
+                match LookupDialog::automatic(hwnd, Arc::clone(&app.bridge)) {
+                    Ok(dialog) => {
+                        dialog.show();
+                        lookup = Some(dialog);
+                    }
+                    Err(_) => app.bridge.auto_prompt_failed(),
+                }
+                dirty = true;
+                continue;
+            }
+            if let Some((id, title)) = app.bridge.lookup_offer() {
+                match LookupDialog::open(hwnd, id, &title, Arc::clone(&app.bridge)) {
+                    Ok(dialog) if dialog.current() => {
+                        dialog.show();
+                        lookup = Some(dialog);
+                    }
+                    _ => app.bridge.answer_lookup(id, None),
+                }
+            }
         }
         let mut handles = [HANDLE::default(); 3];
         let mut n = 0;
@@ -826,7 +933,10 @@ pub fn run(bridge: Arc<UiBridge>, stop: HANDLE, show: HANDLE) -> Result<()> {
         }
         if deadline.is_some() && result.0 == WAIT_OBJECT_0.0 + timer_index as u32 {
             timer.deadline = None;
-            dirty = paint_at.is_some_and(|at| at <= t + 0.0001);
+            dirty = paint_at.is_some_and(|at| at <= t);
+            if track_at.is_some_and(|at| at <= t + 0.0001) {
+                dirty |= app.layout(t);
+            }
         } else if !closing && result == WAIT_OBJECT_0 {
             app.anim.close(t);
             dirty = true;
@@ -853,20 +963,7 @@ pub fn run(bridge: Arc<UiBridge>, stop: HANDLE, show: HANDLE) -> Result<()> {
             }
             if m.hwnd == hwnd {
                 match m.message {
-                    LOOKUP_OFFER | DISMISS_LOOKUP => {
-                        if app.anim.closing.is_none()
-                            && lookup.is_none()
-                            && let Some((id, title)) = app.bridge.lookup_offer()
-                        {
-                            match LookupDialog::open(hwnd, id, &title, Arc::clone(&app.bridge)) {
-                                Ok(dialog) if dialog.current() => {
-                                    dialog.show();
-                                    lookup = Some(dialog);
-                                }
-                                _ => app.bridge.answer_lookup(id, None),
-                            }
-                        }
-                        dirty = true;
+                    LOOKUP_OFFER | DISMISS_LOOKUP | ASK_AUTO => {
                         continue;
                     }
                     SNAPSHOT => {
@@ -880,14 +977,26 @@ pub fn run(bridge: Arc<UiBridge>, stop: HANDLE, show: HANDLE) -> Result<()> {
                         continue;
                     }
                     INPUT => {
+                        let event = m.wParam.0 as u32;
+                        let before = (
+                            app.anim.hovered,
+                            app.close_hover,
+                            app.press.as_ref().filter(|p| p.dragged).map(|p| p.offset),
+                        );
                         app.input(m.wParam.0 as u32, m.lParam, start.elapsed().as_secs_f64());
-                        dirty = true;
+                        dirty |= !matches!(event, WM_MOUSEMOVE | LEAVE)
+                            || before
+                                != (
+                                    app.anim.hovered,
+                                    app.close_hover,
+                                    app.press.as_ref().filter(|p| p.dragged).map(|p| p.offset),
+                                );
                         continue;
                     }
                     DISPLAY => {
                         app.placement.invalidate();
                         app.anim.reduced = reduced_motion();
-                        app.layout(t, true);
+                        app.layout(t);
                         obscured = covered(hwnd, app.origin, disc_dpi(app.anchor.dpi));
                         dirty = true;
                         continue;
@@ -926,6 +1035,70 @@ mod tests {
     use windows::Win32::System::Threading::{CreateEventW, SetEvent};
     use windows::core::Owned;
 
+    #[test]
+    fn steady_frames_coalesce_timer_and_window_messages_in_the_same_slot() {
+        let mut budget = SteadyFrames::default();
+        for i in 0..900 {
+            let t = (i as f64 + 0.1) / 60.;
+            assert!(budget.allow(t, Some(60.)));
+            assert!(!budget.allow(t + 0.00001, Some(60.)));
+            assert!(!budget.allow(t + 0.01, Some(60.)));
+        }
+        assert!(budget.allow(15.0, None));
+        assert!(budget.allow(15.001, None));
+        assert!(budget.allow(15.002, Some(60.)));
+    }
+    #[test]
+    fn stationary_click_keeps_the_pressed_control_when_the_dock_moves() {
+        let cursor = (350, 55);
+        let press = Press {
+            part: Part::Disc,
+            cursor,
+            original: (340, 45),
+            offset: (0, 0),
+            dragged: false,
+        };
+        assert_eq!(
+            press.released_part(Part::Close, cursor, true),
+            Some(Part::Disc)
+        );
+        assert_eq!(press.released_part(Part::Close, cursor, false), None);
+        assert_eq!(press.released_part(Part::Close, (349, 55), true), None);
+        let close = Press {
+            part: Part::Close,
+            ..press
+        };
+        assert_eq!(
+            close.released_part(Part::Outside, cursor, true),
+            Some(Part::Close)
+        );
+        assert_eq!(
+            close.released_part(Part::Close, (349, 55), false),
+            Some(Part::Close)
+        );
+    }
+
+    #[test]
+    fn moving_dock_follows_each_edge_without_a_second_transition() {
+        let mut motion = Move {
+            from: (-20, 0),
+            to: (7, 0),
+            since: 0.0,
+        };
+        for (i, right) in [7, 20, 40, 190, 161, 70, 22].into_iter().enumerate() {
+            let t = i as f64 / 240.0;
+            let edge = (right + 15, 11);
+            assert!(motion.follow(edge, t, true));
+            assert_eq!(motion.at(t), edge);
+            assert!(!motion.follow(edge, t, true));
+        }
+        let t = 1.0;
+        assert!(motion.follow((100, 20), t, false));
+        assert_ne!(motion.at(t), (100, 20));
+        assert!(motion.follow((100, 20), t, true));
+        assert_eq!(motion.at(t), (100, 20));
+    }
+
     #[derive(Debug)]
     struct Sample {
         window: usize,
@@ -937,6 +1110,7 @@ mod tests {
         width: f32,
         tooltip: f32,
         idle: bool,
+        steady: bool,
     }
 
     thread_local! {static OBSERVER:RefCell<Option<Sender<Sample>>>=const {RefCell::new(None)};}
@@ -953,9 +1127,13 @@ mod tests {
                     reduced: app.anim.reduced,
                     expanded: app.anim.expanded,
                     closing: app.anim.closing.is_some(),
+                    steady: unsafe { GetPropW(app.window, PLAYBACK_DRAWING) }.0 as usize == 1,
                     width: p.width,
                     tooltip: p.tip,
-                    idle: !app.anim.animating(t, app.view.media.is_some())
+                    idle: app
+                        .anim
+                        .frame_rate(t, app.view.media.is_some(), false, app.anchor.hz)
+                        .is_none()
                         && app.anim.hint_deadline(t).is_none(),
                 });
             }
@@ -986,6 +1164,54 @@ mod tests {
             SetThreadDpiAwarenessContext(previous);
             result.unwrap();
         }
+    }
+    fn measure_five_minutes(rx: &Receiver<Sample>, hwnd: HWND) {
+        use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+        fn cpu_time() -> f64 {
+            let mut created = FILETIME::default();
+            let mut exited = FILETIME::default();
+            let mut kernel = FILETIME::default();
+            let mut user = FILETIME::default();
+            unsafe {
+                GetProcessTimes(
+                    GetCurrentProcess(),
+                    &mut created,
+                    &mut exited,
+                    &mut kernel,
+                    &mut user,
+                )
+            }
+            .unwrap();
+            let ticks =
+                |f: FILETIME| (u64::from(f.dwHighDateTime) << 32) + u64::from(f.dwLowDateTime);
+            (ticks(kernel) + ticks(user)) as f64 / 10_000_000.
+        }
+        let cores = std::thread::available_parallelism().unwrap().get();
+        let rate = |key| unsafe { GetPropW(hwnd, key) }.0 as usize as f64 / 1000.;
+        let hz = rate(TARGET_HZ);
+        assert!(hz >= 140.);
+        let cpu = cpu_time();
+        let start = Instant::now();
+        let mut frames = 0;
+        let mut transitions = 0;
+        while start.elapsed() < Duration::from_secs(300) {
+            let sample = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("renderer stopped");
+            if !sample.steady {
+                transitions += 1;
+            }
+            frames += 1;
+        }
+        let wall = start.elapsed().as_secs_f64();
+        let cpu = cpu_time() - cpu;
+        let rendered = f64::from(frames) / wall;
+        let percent = 100. * cpu / (wall * cores as f64);
+        eprintln!(
+            "Synthetic playback, native layered HWND: {wall:.2}s, {hz:.2}Hz display, {rendered:.2} actual draws/s ({transitions} transition frames), CPU {cpu:.4}s / {cores} logical processors = {percent:.3}% of capacity."
+        );
+        assert_eq!(transitions, 0);
+        assert!((54.0..=60.01).contains(&rendered));
     }
     #[test]
     fn private_layered_window_handles_mouse_show_and_stop() {
@@ -1028,6 +1254,19 @@ mod tests {
                 if !first.reduced {
                     let mut playing = bridge.latest();
                     playing.media.as_mut().unwrap().playing = true;
+                    let benchmark = std::env::var_os("RAIN_NIGHT_TEST_SPIN_300S").is_some();
+                    if benchmark {
+                        let mut pixels = vec![0u8; 48 * 48 * 4];
+                        for (i, color) in pixels.chunks_exact_mut(4).enumerate() {
+                            color.copy_from_slice(&[
+                                (i / 48 * 5) as u8,
+                                (i % 48 * 5) as u8,
+                                150,
+                                255,
+                            ]);
+                        }
+                        playing.cover = Some(Arc::new(crate::desktop::Cover { size: 48, pixels }));
+                    }
                     bridge.publish(playing);
                     let started = Instant::now();
                     until(&rx, |_| started.elapsed() >= Duration::from_millis(2150));
@@ -1037,6 +1276,9 @@ mod tests {
                         "Private layered HWND: target {target:.2} Hz, measured {measured:.2} draws/s."
                     );
                     assert!(target >= 1.0 && measured > 0.0);
+                    if benchmark {
+                        measure_five_minutes(&rx, hwnd);
+                    }
                 }
                 unsafe {
                     SetEvent(*show).unwrap();

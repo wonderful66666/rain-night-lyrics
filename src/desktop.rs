@@ -4,9 +4,10 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering},
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU32, AtomicU64, Ordering},
 };
+use std::thread::Thread;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
@@ -76,9 +77,42 @@ pub struct UiBridge {
     snapshot: Mutex<UiSnapshot>,
     lookup_requested: AtomicBool,
     confirmation: Mutex<LookupConfirmation>,
+    policy: LookupPolicy,
+    worker: OnceLock<Thread>,
     hwnd: AtomicIsize,
     size: AtomicU32,
     pub finished: AtomicBool,
+}
+
+struct LookupPolicy {
+    dir: Option<PathBuf>,
+    revision: Arc<AtomicU64>,
+    menu_source: AtomicU8,
+    ask_pending: AtomicBool,
+    prompt_failed: AtomicBool,
+}
+
+impl LookupPolicy {
+    fn new(dir: Option<PathBuf>) -> Self {
+        let revision = match dir.as_deref().and_then(crate::settings::auto_lookup) {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        };
+        Self {
+            dir,
+            revision: Arc::new(AtomicU64::new(revision)),
+            menu_source: AtomicU8::new(0),
+            ask_pending: AtomicBool::new(false),
+            prompt_failed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Default for LookupPolicy {
+    fn default() -> Self {
+        Self::new(data_dir(false))
+    }
 }
 
 #[derive(Default)]
@@ -91,10 +125,101 @@ pub type LookupAnswer = (u64, Option<(String, String)>);
 
 pub const LOOKUP_OFFER: u32 = WM_APP + 7;
 pub const DISMISS_LOOKUP: u32 = WM_APP + 8;
+pub const ASK_AUTO: u32 = WM_APP + 9;
 
 impl UiBridge {
+    pub fn bind_worker(&self) {
+        let _ = self.worker.set(std::thread::current());
+    }
+    fn wake_worker(&self) {
+        if let Some(worker) = self.worker.get() {
+            worker.unpark();
+        }
+    }
+    fn post(&self, msg: u32) {
+        let hwnd = HWND(self.hwnd.load(Ordering::Acquire) as *mut _);
+        if !hwnd.is_invalid() {
+            let _ = unsafe { PostMessageW(hwnd, msg, WPARAM(0), LPARAM(0)) };
+        }
+    }
+    pub fn auto_policy(&self) -> (Option<bool>, u64) {
+        let revision = self.policy.revision.load(Ordering::Acquire);
+        let choice = match revision & 3 {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        };
+        (choice, revision)
+    }
+    pub fn auto_revision(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.policy.revision)
+    }
+    pub fn set_lookup_context(&self, manual_enabled: bool, ask_auto: bool, active_music: bool) {
+        self.policy.menu_source.store(
+            if active_music {
+                2
+            } else {
+                u8::from(manual_enabled)
+            },
+            Ordering::Release,
+        );
+        if ask_auto
+            && self.auto_policy().0.is_none()
+            && !self.policy.prompt_failed.load(Ordering::Acquire)
+            && !self.policy.ask_pending.swap(true, Ordering::AcqRel)
+        {
+            self.post(ASK_AUTO);
+        }
+    }
+    pub fn can_request_lookup(&self) -> bool {
+        match self.policy.menu_source.load(Ordering::Acquire) {
+            2 => self.auto_policy().0 == Some(false),
+            1 => true,
+            _ => false,
+        }
+    }
+    pub fn ask_auto_pending(&self) -> bool {
+        self.policy.ask_pending.load(Ordering::Acquire) && self.auto_policy().0.is_none()
+    }
+    pub fn auto_prompt_failed(&self) {
+        self.policy.prompt_failed.store(true, Ordering::Release);
+        self.policy.ask_pending.store(false, Ordering::Release);
+        log("无法打开自动查词询问窗口");
+    }
+    #[cfg(test)]
+    pub fn with_settings_dir(dir: PathBuf) -> Self {
+        Self {
+            policy: LookupPolicy::new(Some(dir)),
+            ..Default::default()
+        }
+    }
+    pub fn choose_auto(&self, enabled: bool) -> std::io::Result<()> {
+        let (old, revision) = self.auto_policy();
+        let save = || {
+            let dir = self
+                .policy
+                .dir
+                .as_deref()
+                .ok_or(std::io::ErrorKind::NotFound)?;
+            crate::settings::set_auto_lookup(dir, enabled)
+        };
+        if enabled {
+            save()?;
+        }
+        if old != Some(enabled) {
+            let next = (revision & !3).wrapping_add(4) | if enabled { 2 } else { 1 };
+            self.policy.revision.store(next, Ordering::Release);
+        }
+        self.policy.ask_pending.store(false, Ordering::Release);
+        self.wake_worker();
+        if !enabled {
+            save()?;
+        }
+        Ok(())
+    }
     pub fn request_lookup(&self) {
         self.lookup_requested.store(true, Ordering::Release);
+        self.wake_worker();
     }
     pub fn take_lookup_request(&self) -> bool {
         self.lookup_requested.swap(false, Ordering::AcqRel)
@@ -112,10 +237,7 @@ impl UiBridge {
         state.answer = None;
         state.offer = offer;
         drop(state);
-        let hwnd = HWND(self.hwnd.load(Ordering::Acquire) as *mut _);
-        if !hwnd.is_invalid() {
-            let _ = unsafe { PostMessageW(hwnd, message, WPARAM(0), LPARAM(0)) };
-        }
+        self.post(message);
     }
     pub fn lookup_offer(&self) -> Option<(u64, String)> {
         self.confirmation.lock().unwrap().offer.clone()
@@ -133,6 +255,7 @@ impl UiBridge {
         if state.offer.as_ref().is_some_and(|(n, _)| *n == id) {
             state.offer = None;
             state.answer = Some((id, fields));
+            self.wake_worker();
         }
     }
     pub fn take_lookup_answer(&self) -> Option<LookupAnswer> {
@@ -140,6 +263,12 @@ impl UiBridge {
     }
     pub fn attach(&self, hwnd: HWND) {
         self.hwnd.store(hwnd.0 as isize, Ordering::Release);
+        if self.ask_auto_pending() {
+            self.post(ASK_AUTO);
+        }
+        if self.lookup_offer().is_some() {
+            self.post(LOOKUP_OFFER);
+        }
     }
     pub fn cover_size(&self, size: u32) {
         self.size.store(size.clamp(16, 256), Ordering::Relaxed);

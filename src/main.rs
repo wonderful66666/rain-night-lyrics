@@ -8,13 +8,14 @@ mod media;
 mod placement;
 mod protocol;
 mod render;
+mod settings;
 mod ui;
 mod wallpaper;
 
 use audio::OutputWatch;
 use desktop::{UiBridge, UiSnapshot};
 use lookup::{Catalog, Outcome};
-use media::{Apartment, ApprovedTrack, LookupPermit, Media, Sessions, Song};
+use media::{Apartment, ApprovedTrack, LookupPermit, Media, Sessions, Source};
 use placement::CapsuleData;
 use std::sync::{
     Arc,
@@ -40,24 +41,58 @@ fn lookup_changed(current: Option<(u64, f64)>, id: u64, duration: f64) -> bool {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdleLyrics {
+    Keep,
+    RetirePacket,
+    Clear,
+}
+
+fn idle_lyrics(
+    stopped_since: &mut Option<Instant>,
+    now: Instant,
+    media_present: bool,
+    applied: bool,
+    already_retired: bool,
+) -> IdleLyrics {
+    if media_present || !applied {
+        *stopped_since = None;
+        return if media_present && applied && !already_retired {
+            IdleLyrics::RetirePacket
+        } else {
+            IdleLyrics::Keep
+        };
+    }
+    let stopped = *stopped_since.get_or_insert(now);
+    if now.saturating_duration_since(stopped) >= Duration::from_millis(1000) {
+        IdleLyrics::Clear
+    } else {
+        IdleLyrics::Keep
+    }
+}
+
 struct Worker {
     revision: Arc<AtomicU64>,
-    requests: mpsc::Sender<(u64, Media, LookupPermit)>,
+    requests: mpsc::Sender<(u64, u64, Media, LookupPermit)>,
     results: mpsc::Receiver<(u64, Outcome)>,
     pending: bool,
 }
 
 impl Worker {
-    fn new() -> Self {
+    fn new(policy: Arc<AtomicU64>) -> Self {
         let revision = Arc::new(AtomicU64::new(1));
         let current = Arc::clone(&revision);
-        let (send, receive) = mpsc::channel::<(u64, Media, LookupPermit)>();
+        let (send, receive) = mpsc::channel::<(u64, u64, Media, LookupPermit)>();
         let (return_result, results) = mpsc::channel();
         thread::spawn(move || {
             let catalog = Catalog::new();
             while let Ok(first) = receive.recv() {
-                let (version, media, permit) = receive.try_iter().last().unwrap_or(first);
-                let valid = || current.load(Ordering::Acquire) == version && permit.valid();
+                let (version, choice, media, permit) = receive.try_iter().last().unwrap_or(first);
+                let valid = || {
+                    current.load(Ordering::Acquire) == version
+                        && policy.load(Ordering::Acquire) == choice
+                        && permit.valid()
+                };
                 if !valid() {
                     continue;
                 }
@@ -78,12 +113,13 @@ impl Worker {
         self.revision.fetch_add(1, Ordering::AcqRel);
         self.pending = false;
     }
-    fn request(&mut self, lookup: &Media, permit: &LookupPermit) {
+    fn request(&mut self, lookup: &Media, permit: &LookupPermit, choice: u64) {
         if !self.pending && permit.valid() {
             self.pending = self
                 .requests
                 .send((
                     self.revision.load(Ordering::Acquire),
+                    choice,
                     lookup.clone(),
                     permit.clone(),
                 ))
@@ -132,9 +168,29 @@ fn check() -> Result<(), String> {
     }
     let mut sessions = Sessions::open().map_err(|_| "无法读取 Windows 媒体会话。")?;
     sessions
-        .current(false, None)
+        .current(false, None, None)
         .map_err(|_| "无法读取 Windows 媒体会话。")?;
-    println!("当前媒体可逐首确认查词　{}", sessions.eligible);
+    let choice = desktop::data_dir(false)
+        .as_deref()
+        .and_then(settings::auto_lookup);
+    let manual = sessions.local_playing.is_some()
+        && sessions
+            .source
+            .is_some_and(|s| s != Source::MusicApp || choice == Some(false));
+    println!("当前媒体可逐首确认查词　{manual}");
+    println!(
+        "当前媒体应用 ID　{}",
+        sessions.app_id.as_deref().unwrap_or("无")
+    );
+    println!(
+        "当前媒体来源　{}",
+        match sessions.source {
+            Some(Source::MusicApp) => "音乐软件",
+            Some(Source::Browser) => "浏览器或视频",
+            Some(Source::Other) => "其他",
+            None => "无",
+        }
+    );
     Ok(())
 }
 
@@ -145,16 +201,19 @@ fn core(bridge: &UiBridge) -> Result<(), String> {
     let mut screens = Vec::new();
     let mut audio = None;
     let mut poll_engine = Instant::now();
-    let mut worker = Worker::new();
+    bridge.bind_worker();
+    let policy = bridge.auto_revision();
+    let mut previous_policy = bridge.auto_policy();
+    let mut worker = Worker::new(Arc::clone(&policy));
     let mut cached: Option<CacheEntry> = None;
     let mut song = None;
     let mut sent: Option<Media> = None;
+    let mut last_applied: Option<Media> = None;
+    let mut stopped_since = None;
     let mut art = None;
     let mut art_key = None;
     let mut retry_art = Instant::now();
     let mut offered = None;
-    let mut last_track: Option<(Song, Instant)> = None;
-    let mut notice_until = None;
     let mut scene = CapsuleData::default();
     let mut delay = 0;
     while !bridge.finished.load(Ordering::Acquire) {
@@ -215,8 +274,26 @@ fn core(bridge: &UiBridge) -> Result<(), String> {
         }
         let request = bridge.take_lookup_request();
         let answer = bridge.take_lookup_answer();
+        let (auto, choice) = bridge.auto_policy();
+        if choice != previous_policy.1 {
+            worker.cancel();
+            if let Some(sessions) = &mut sessions {
+                sessions.revoke();
+            }
+            if auto == Some(false)
+                && last_applied.is_some()
+                && let Some(engine) = &engine
+            {
+                clear_automatic(engine, &screens, last_applied.as_ref());
+                last_applied = None;
+            }
+            cached = None;
+            sent = None;
+            song = None;
+            previous_policy = (auto, choice);
+        }
         let current = match sessions.as_mut() {
-            Some(manager) if waiting.is_none() => match manager.current(request, answer) {
+            Some(manager) if waiting.is_none() => match manager.current(request, answer, auto) {
                 Ok(m) => m,
                 Err(_) => {
                     sessions = None;
@@ -228,13 +305,28 @@ fn core(bridge: &UiBridge) -> Result<(), String> {
                 None
             }
         };
+        let source = sessions.as_ref().and_then(|s| s.source);
+        let local_playing = sessions.as_ref().and_then(|s| s.local_playing);
+        let ask = source == Some(Source::MusicApp) && auto.is_none() && local_playing == Some(true);
+        let manual = sessions.as_ref().is_some_and(|s| s.eligible);
+        bridge.set_lookup_context(
+            manual,
+            ask,
+            source == Some(Source::MusicApp) && local_playing.is_some(),
+        );
+        if sessions.as_ref().is_some_and(|s| s.rechecking) {
+            thread::park_timeout(Duration::from_millis(20));
+            continue;
+        }
         let offer = sessions.as_ref().and_then(Sessions::offer);
+        let notice_until = sessions.as_ref().and_then(|s| s.notice_deadline);
         if offer.as_ref().map(|(id, _)| *id) != offered {
             offered = offer.as_ref().map(|(id, _)| *id);
             bridge.offer_lookup_title(offer);
         }
         let Some(ApprovedTrack {
             media: m,
+            display_artist,
             permit,
             id,
             lookup_media,
@@ -242,46 +334,69 @@ fn core(bridge: &UiBridge) -> Result<(), String> {
         else {
             if song.take().is_some() {
                 worker.cancel();
-                if let Some(engine) = &engine {
-                    clear_automatic(engine, &screens, sent.as_ref());
-                }
                 sent = None;
             }
+            let action = idle_lyrics(
+                &mut stopped_since,
+                now,
+                local_playing.is_some(),
+                last_applied.is_some(),
+                sent.is_some(),
+            );
+            if let (Some(engine), Some(previous)) = (&engine, last_applied.as_ref()) {
+                if action == IdleLyrics::Clear {
+                    clear_automatic(engine, &screens, Some(previous));
+                    last_applied = None;
+                } else if action == IdleLyrics::RetirePacket {
+                    let retired = protocol::metadata_only(previous);
+                    let mut delivered = true;
+                    for display in &screens {
+                        delivered &= engine.send(display, &retired);
+                    }
+                    if delivered {
+                        sent = Some(previous.clone());
+                    }
+                }
+            }
             cached = None;
-            last_track = None;
-            notice_until = None;
             art = None;
             art_key = None;
-            let mut snapshot = idle(
-                if sessions.as_ref().is_some_and(|manager| manager.eligible) {
-                    "右键可查本首歌词"
-                } else {
-                    "等待播放"
-                },
-            );
+            let mut snapshot = idle(if ask {
+                "等你选择"
+            } else if manual && source == Some(Source::MusicApp) && auto == Some(false) {
+                "自动查词已关"
+            } else if manual {
+                "右键可查这一首"
+            } else {
+                "等待播放"
+            });
             snapshot.media = sessions
                 .as_ref()
                 .and_then(|s| s.local_playing)
                 .map(Media::anonymous);
+            snapshot.placement.unknown_width |= snapshot.media.is_some();
+            let now = Instant::now();
+            let notice = notice_until.filter(|end| *end > now && snapshot.media.is_some());
+            if notice.is_some() {
+                snapshot.placement.notice = Some((String::new(), String::new()));
+            }
             bridge.publish(snapshot);
-            thread::park_timeout(Duration::from_millis(500));
+            let poll = Duration::from_millis(500);
+            thread::park_timeout(notice.map_or(poll, |end| poll.min(end - now)));
             continue;
         };
+        stopped_since = None;
         if lookup_changed(song, id, lookup_media.duration) {
             worker.cancel();
             song = Some((id, lookup_media.duration));
             cached = None;
             sent = None;
         }
-        if let Some((old, when)) = &last_track
-            && old != &m.song
+        let key = (id, bridge.desired_size());
+        if art_key.as_ref() != Some(&key)
+            || sessions.as_ref().is_some_and(|s| s.cover_changed)
+            || (art.is_none() && now >= retry_art)
         {
-            notice_until = (now.duration_since(*when) < Duration::from_secs(5))
-                .then_some(now + Duration::from_millis(3450));
-        }
-        last_track = Some((m.song.clone(), now));
-        let key = (m.song.clone(), bridge.desired_size());
-        if art_key.as_ref() != Some(&key) || (art.is_none() && now >= retry_art) {
             art = sessions
                 .as_ref()
                 .and_then(|manager| manager.cover(key.1))
@@ -310,7 +425,7 @@ fn core(bridge: &UiBridge) -> Result<(), String> {
         }
         let entry = cached.as_ref();
         if entry.is_none() && m.playing && waiting.is_none() {
-            worker.request(&lookup_media, &permit);
+            worker.request(&lookup_media, &permit, choice);
         }
         let words = entry.and_then(|e| {
             if let Outcome::Found(w) = &e.result {
@@ -319,7 +434,8 @@ fn core(bridge: &UiBridge) -> Result<(), String> {
                 None
             }
         });
-        if !permit.valid() {
+        let valid = || permit.valid() && policy.load(Ordering::Acquire) == choice;
+        if !valid() {
             continue;
         }
         let mut delivered = true;
@@ -329,12 +445,14 @@ fn core(bridge: &UiBridge) -> Result<(), String> {
         {
             let packet = protocol::build(&m, words);
             for display in &screens {
-                if !permit.valid() {
+                if !valid() {
                     delivered = false;
                     break;
                 }
                 if !engine.send(display, &packet) {
                     delivered = false;
+                } else {
+                    last_applied = Some(m.clone());
                 }
             }
             if delivered {
@@ -343,7 +461,7 @@ fn core(bridge: &UiBridge) -> Result<(), String> {
                 poll_engine = Instant::now();
             }
         }
-        if !permit.valid() {
+        if !valid() {
             continue;
         }
         let state = if !delivered {
@@ -359,37 +477,77 @@ fn core(bridge: &UiBridge) -> Result<(), String> {
                 None => "正在找歌词",
             }
         };
-        let (title, subtitle) = words
-            .and_then(|w| w.displayed(&m, delay))
-            .unwrap_or((&m.song.title, &m.song.artist));
-        let placement = CapsuleData {
-            title: title.to_owned(),
-            subtitle: subtitle.to_owned(),
-            notice: notice_until
-                .filter(|until| *until > now)
-                .map(|_| ("正在播放".into(), m.song.title.clone())),
-            ..scene.clone()
-        };
-        bridge.publish(UiSnapshot {
-            media: Some(m),
-            cover: art.clone(),
-            status: waiting.unwrap_or(state),
-            placement,
-        });
-        thread::park_timeout(Duration::from_millis(480));
+        let scene_clock = sent.as_ref().unwrap_or(&m);
+        let next_poll = Instant::now() + Duration::from_millis(480);
+        loop {
+            if !valid()
+                || bridge.finished.load(Ordering::Acquire)
+                || sessions.as_ref().is_some_and(Sessions::needs_refresh)
+            {
+                break;
+            }
+            let tick = Instant::now();
+            let mut playback = scene_clock.clone();
+            if playback.playing
+                && let Some(position) = &mut playback.position
+            {
+                let elapsed = media::now_ms().saturating_sub(playback.sent).max(0) as f64 / 1000.0;
+                *position += elapsed * playback.rate;
+                if playback.duration > 0.0 {
+                    *position = position.min(playback.duration);
+                }
+            }
+            let (title, subtitle) = words
+                .and_then(|w| w.displayed(&playback, delay))
+                .unwrap_or((&m.song.title, &display_artist));
+            let notice_deadline = notice_until.filter(|end| *end > tick);
+            bridge.publish(UiSnapshot {
+                media: Some(m.clone()),
+                cover: art.clone(),
+                status: waiting.unwrap_or(state),
+                placement: CapsuleData {
+                    title: title.to_owned(),
+                    subtitle: subtitle.to_owned(),
+                    unknown_width: scene.unknown_width
+                        || !delivered
+                        || (words.is_some() && playback.position.is_none()),
+                    notice: notice_deadline.map(|_| ("正在播放".into(), m.song.title.clone())),
+                    ..scene.clone()
+                },
+            });
+            let remaining = next_poll.saturating_duration_since(tick);
+            if remaining.is_zero() {
+                break;
+            }
+            let mut sleep = remaining;
+            if let Some(change) = words.and_then(|w| w.next_layout_change(&playback, delay)) {
+                sleep = sleep.min(change);
+            }
+            if let Some(end) = notice_deadline {
+                sleep = sleep.min(end - tick);
+            }
+            thread::park_timeout(sleep);
+            if Instant::now() >= next_poll {
+                break;
+            }
+        }
     }
     worker.cancel();
     if let Some(engine) = Engine::find() {
-        clear_automatic(&engine, &engine.displays(), sent.as_ref());
+        clear_automatic(&engine, &engine.displays(), last_applied.as_ref());
     }
     Ok(())
 }
 
 fn clear_automatic(engine: &Engine, displays: &[String], last: Option<&Media>) {
+    let legacy: Vec<_> = displays
+        .iter()
+        .filter(|display| !engine.handles_lyric_clear(display))
+        .collect();
     if let Some(media) = last {
         let mut wait = false;
         let packet = protocol::metadata_only(media);
-        for display in displays {
+        for display in &legacy {
             if engine.in_playlist(display) {
                 wait |= engine.send(display, &packet);
             }
@@ -405,11 +563,14 @@ fn clear_automatic(engine: &Engine, displays: &[String], last: Option<&Media>) {
             thread::sleep(Duration::from_millis(100));
             cleared = engine.send(display, "");
         }
-        if cleared {
+        if cleared && !engine.handles_lyric_clear(display) {
             cleared_displays.push(display.clone())
-        } else {
+        } else if !cleared {
             desktop::log("清空歌词时场景不可用");
         }
+    }
+    if cleared_displays.is_empty() {
+        return;
     }
     let (count, retry) = engine.reload(&cleared_displays, ReloadReason::LyricsCleared);
     if count > 0 {
@@ -496,7 +657,37 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media::Source;
+    use crate::media::{Song, Source};
+    #[test]
+    fn a_brief_session_gap_between_songs_never_clears_the_scene() {
+        let start = Instant::now();
+        let mut stopped = None;
+        let at = |millis| start + Duration::from_millis(millis);
+        assert_eq!(
+            idle_lyrics(&mut stopped, at(0), false, true, false),
+            IdleLyrics::Keep
+        );
+        assert_eq!(
+            idle_lyrics(&mut stopped, at(400), true, true, false),
+            IdleLyrics::RetirePacket
+        );
+        assert_eq!(
+            idle_lyrics(&mut stopped, at(880), true, true, true),
+            IdleLyrics::Keep
+        );
+        assert_eq!(
+            idle_lyrics(&mut stopped, at(1000), false, true, true),
+            IdleLyrics::Keep
+        );
+        assert_eq!(
+            idle_lyrics(&mut stopped, at(2000), false, true, true),
+            IdleLyrics::Clear
+        );
+        assert_eq!(
+            idle_lyrics(&mut stopped, at(2200), false, false, false),
+            IdleLyrics::Keep
+        );
+    }
     #[test]
     fn late_timeline_reopens_an_ambiguous_search() {
         assert!(duration_changed(0.0, 204.133));
@@ -551,7 +742,7 @@ mod tests {
         now.playing = false;
         assert!(now.needs_sync(&old));
         now.playing = true;
-        now.song.source = Source::NetEase;
+        now.song.source = Source::MusicApp;
         assert!(now.needs_sync(&old));
         now.song = old.song.clone();
         now.sent += 5000;

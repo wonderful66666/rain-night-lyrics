@@ -103,13 +103,15 @@ fn names(title: &str, video: bool) -> Vec<String> {
     result
 }
 
+pub(crate) fn suggested_title(title: &str, source: Source) -> String {
+    names(title, source.from_video())
+        .into_iter()
+        .find(|s| crate::media::eligible_title(s))
+        .unwrap_or_default()
+}
+
 fn query_title(song: &Song) -> Option<&str> {
-    match song.source {
-        Source::Browser | Source::NetEase => {
-            (!song.title.trim().is_empty()).then_some(song.title.as_str())
-        }
-        Source::Other => None,
-    }
+    crate::media::eligible_title(&song.title).then_some(song.title.as_str())
 }
 
 #[derive(Clone)]
@@ -496,7 +498,7 @@ impl Catalog {
         let Some(title) = query_title(&m.song) else {
             return Outcome::Missing;
         };
-        let order = if m.song.source == Source::NetEase {
+        let order = if m.song.source == Source::MusicApp {
             [Provider::NetEase, Provider::LrcLib]
         } else {
             [Provider::LrcLib, Provider::NetEase]
@@ -559,13 +561,11 @@ mod tests {
             artist: "UP 主".into(),
             source: Source::Browser,
         };
-        for source in [Source::Browser, Source::NetEase] {
+        for source in [Source::Browser, Source::MusicApp, Source::Other] {
             song.source = source;
             assert_eq!(query_title(&song), Some(song.title.as_str()));
         }
-        song.source = Source::Other;
-        assert!(query_title(&song).is_none());
-        song.source = Source::NetEase;
+        song.source = Source::MusicApp;
         song.title = " ".into();
         assert!(query_title(&song).is_none());
     }

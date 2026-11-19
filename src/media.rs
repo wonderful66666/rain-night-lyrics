@@ -5,6 +5,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use windows::ApplicationModel::AppInfo;
 use windows::Foundation::{
     AsyncStatus, EventRegistrationToken, IAsyncOperation, TypedEventHandler,
 };
@@ -23,7 +24,7 @@ use windows::core::{HRESULT, Result, RuntimeType};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Source {
-    NetEase,
+    MusicApp,
     Browser,
     Other,
 }
@@ -35,7 +36,7 @@ impl Source {
             app.as_str(),
             "cloudmusic.exe" | "1f8b0f94.122165ae053f_j2p0p5q0044a6!app"
         ) {
-            Self::NetEase
+            Self::MusicApp
         } else if matches!(
             app.as_str(),
             "chrome"
@@ -61,8 +62,53 @@ impl Source {
     }
 
     pub fn from_video(self) -> bool {
-        self == Self::Browser
+        self != Self::MusicApp
     }
+
+    fn with_registered_name(self, name: &str) -> Self {
+        if self == Self::Other
+            && (name == "哔哩哔哩" || name == "嗶哩嗶哩" || name.eq_ignore_ascii_case("bilibili"))
+        {
+            Self::Browser
+        } else {
+            self
+        }
+    }
+
+    fn for_playback(
+        self,
+        info: Option<MediaPlaybackType>,
+        item: Option<MediaPlaybackType>,
+    ) -> Self {
+        if self != Self::MusicApp {
+            return self;
+        }
+        if info.or(item).is_none()
+            || [info, item]
+                .into_iter()
+                .flatten()
+                .any(|t| t != MediaPlaybackType::Music)
+        {
+            Self::Browser
+        } else {
+            Self::MusicApp
+        }
+    }
+
+    fn lookup_mode(self, auto: Option<bool>) -> LookupMode {
+        match (self, auto) {
+            (Self::MusicApp, None) => LookupMode::AwaitChoice,
+            (Self::MusicApp, Some(true)) => LookupMode::Automatic,
+            _ => LookupMode::Manual,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LookupMode {
+    AwaitChoice,
+    Automatic,
+    Manual,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -154,14 +200,6 @@ fn valid_session_title(title: &str) -> bool {
     !title.trim().is_empty() && title.chars().take(4097).count() <= 4096
 }
 
-fn suggested_title(source: Source, original: &str) -> String {
-    if source == Source::NetEase && eligible_title(original) {
-        original.to_owned()
-    } else {
-        String::new()
-    }
-}
-
 fn wallpaper_title(raw: &str) -> String {
     raw.split_whitespace()
         .collect::<Vec<_>>()
@@ -178,7 +216,7 @@ struct LookupInput {
 
 impl LookupInput {
     fn media(&self, playback: &Media, original_title: &str, local_artist: &str) -> Media {
-        let changed_video_title = playback.song.source == Source::Browser
+        let changed_video_title = playback.song.source.from_video()
             && !self.title.eq_ignore_ascii_case(original_title.trim());
         let artist = if !self.artist.is_empty() {
             &self.artist
@@ -243,6 +281,7 @@ pub struct LookupPermit {
 
 pub struct ApprovedTrack {
     pub media: Media,
+    pub display_artist: String,
     pub permit: LookupPermit,
     pub id: u64,
     pub lookup_media: Media,
@@ -255,7 +294,7 @@ impl LookupPermit {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct TrackKey {
     title: String,
     artist: String,
@@ -263,24 +302,123 @@ struct TrackKey {
     number: i32,
 }
 
-struct TrackConsent {
+struct ActiveTrack {
     id: u64,
-    key: Option<TrackKey>,
-    source_id: String,
-    lookup: Option<LookupInput>,
-    offered_at: Instant,
+    key: TrackKey,
+    source: Source,
+    automatic: bool,
     permit: LookupPermit,
-    session: Session,
-    token: EventRegistrationToken,
 }
 
-fn may_read_item(request: bool, approved: bool, id: u64, reply: Option<u64>) -> bool {
-    request || approved || reply == Some(id)
+#[derive(Debug, PartialEq, Eq)]
+enum TrackChange {
+    Same,
+    Automatic,
+    Offer,
+    Inactive,
 }
 
-impl Drop for TrackConsent {
+impl ActiveTrack {
+    fn new(
+        key: TrackKey,
+        source: Source,
+        automatic: bool,
+        current: &Arc<AtomicU64>,
+        revision: u64,
+    ) -> Self {
+        static NEXT_TRACK: AtomicU64 = AtomicU64::new(1);
+        Self {
+            id: NEXT_TRACK.fetch_add(1, Ordering::Relaxed),
+            key,
+            source,
+            automatic,
+            permit: LookupPermit {
+                current: Arc::clone(current),
+                current_revision: revision,
+                item: Arc::new(AtomicU64::new(0)),
+                item_revision: 0,
+            },
+        }
+    }
+
+    fn matches(&self, key: &TrackKey, source: Source, automatic: bool) -> bool {
+        self.source == source
+            && self.automatic == automatic
+            && self.key == *key
+            && self.permit.valid()
+    }
+
+    fn observe(
+        slot: &mut Option<Self>,
+        key: TrackKey,
+        source: Source,
+        mode: LookupMode,
+        request: bool,
+        current: &Arc<AtomicU64>,
+        revision: u64,
+    ) -> TrackChange {
+        let automatic = mode == LookupMode::Automatic;
+        let offer = mode == LookupMode::Manual && request;
+        if !offer
+            && mode != LookupMode::AwaitChoice
+            && slot
+                .as_ref()
+                .is_some_and(|track| track.matches(&key, source, automatic))
+        {
+            return TrackChange::Same;
+        }
+        *slot = None;
+        if !automatic && !offer {
+            return TrackChange::Inactive;
+        }
+        *slot = Some(Self::new(key, source, automatic, current, revision));
+        if offer {
+            TrackChange::Offer
+        } else {
+            TrackChange::Automatic
+        }
+    }
+}
+
+impl Drop for ActiveTrack {
     fn drop(&mut self) {
         self.permit.item.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+struct TrackConsent {
+    lookup: Option<LookupInput>,
+    offered_at: Instant,
+}
+
+struct LayoutEvents {
+    session: Session,
+    token: EventRegistrationToken,
+    revision: Arc<AtomicU64>,
+    seen: u64,
+}
+
+impl LayoutEvents {
+    fn listen(session: &Session) -> Result<Self> {
+        let revision = Arc::new(AtomicU64::new(1));
+        let signal = Arc::clone(&revision);
+        let owner = thread::current();
+        let token = session.MediaPropertiesChanged(&TypedEventHandler::new(move |_, _| {
+            signal.fetch_add(1, Ordering::AcqRel);
+            owner.unpark();
+            Ok(())
+        }))?;
+        Ok(Self {
+            session: session.clone(),
+            token,
+            revision,
+            seen: 0,
+        })
+    }
+}
+
+impl Drop for LayoutEvents {
+    fn drop(&mut self) {
         let _ = self.session.RemoveMediaPropertiesChanged(self.token);
     }
 }
@@ -289,10 +427,19 @@ pub struct Sessions {
     manager: SessionManager,
     current: Arc<AtomicU64>,
     token: EventRegistrationToken,
+    track: Option<ActiveTrack>,
     consent: Option<TrackConsent>,
+    deferred_action: Option<(bool, Option<LookupAnswer>)>,
+    layout_events: Option<LayoutEvents>,
+    pub notice_deadline: Option<Instant>,
     cover: Option<IRandomAccessStreamReference>,
     pub eligible: bool,
     pub local_playing: Option<bool>,
+    pub source: Option<Source>,
+    pub app_id: Option<String>,
+    app_source: Source,
+    pub rechecking: bool,
+    pub cover_changed: bool,
 }
 
 impl Drop for Sessions {
@@ -307,18 +454,29 @@ impl Sessions {
         let manager = finish(SessionManager::RequestAsync()?)?;
         let current = Arc::new(AtomicU64::new(0));
         let changes = Arc::clone(&current);
+        let owner = thread::current();
         let token = manager.CurrentSessionChanged(&TypedEventHandler::new(move |_, _| {
             changes.fetch_add(1, Ordering::AcqRel);
+            owner.unpark();
             Ok(())
         }))?;
         Ok(Self {
             manager,
             current,
             token,
+            track: None,
             consent: None,
+            deferred_action: None,
+            layout_events: None,
+            notice_deadline: None,
             cover: None,
             eligible: false,
             local_playing: None,
+            source: None,
+            app_id: None,
+            app_source: Source::Other,
+            rechecking: false,
+            cover_changed: false,
         })
     }
 
@@ -381,38 +539,86 @@ impl Sessions {
 
     pub fn offer(&self) -> Option<(u64, String)> {
         let consent = self.consent.as_ref()?;
-        if consent.lookup.is_some() || !consent.permit.valid() {
+        let track = self.track.as_ref()?;
+        if consent.lookup.is_some() || !track.permit.valid() {
             return None;
         }
         Some((
-            consent.id,
-            suggested_title(
-                Source::identify(&consent.source_id),
-                &consent.key.as_ref()?.title,
-            ),
+            track.id,
+            crate::lookup::suggested_title(&track.key.title, track.source),
         ))
+    }
+
+    pub fn revoke(&mut self) {
+        self.track = None;
+        self.consent = None;
+        self.deferred_action = None;
+        self.cover = None;
+    }
+
+    pub fn needs_refresh(&self) -> bool {
+        self.layout_events
+            .as_ref()
+            .is_some_and(|watch| watch.revision.load(Ordering::Acquire) != watch.seen)
     }
 
     pub fn current(
         &mut self,
         request: bool,
         answer: Option<LookupAnswer>,
+        auto: Option<bool>,
     ) -> Result<Option<ApprovedTrack>> {
-        static NEXT_OFFER: AtomicU64 = AtomicU64::new(1);
+        let (previous_request, previous_answer) = self.deferred_action.take().unwrap_or_default();
+        let request = request || previous_request;
+        let answer = answer.or(previous_answer);
         self.eligible = false;
         self.local_playing = None;
-        self.cover = None;
+        self.source = None;
+        self.rechecking = false;
+        self.cover_changed = false;
         let current_revision = self.current.load(Ordering::Acquire);
         let session = match self.manager.GetCurrentSession() {
             Ok(s) => s,
             Err(e) if e.code().0 == 0 || e.code().0 == 0x80004003u32 as i32 => {
-                self.consent = None;
+                self.revoke();
+                self.layout_events = None;
+                self.notice_deadline = None;
+                self.app_id = None;
                 return Ok(None);
             }
             Err(e) => return Err(e),
         };
+        if self
+            .layout_events
+            .as_ref()
+            .is_some_and(|events| events.session != session)
+        {
+            self.revoke();
+            self.layout_events = None;
+        }
+        if self.layout_events.is_none() {
+            self.layout_events = LayoutEvents::listen(&session).ok();
+        }
+        if let Some(events) = &mut self.layout_events {
+            let observed = events.revision.load(Ordering::Acquire);
+            self.cover_changed = observed != events.seen;
+            events.seen = observed;
+        }
         let app_id = session.SourceAppUserModelId()?.to_string_lossy();
-        let source = Source::identify(&app_id);
+        if self.app_id.as_deref() != Some(&app_id) {
+            self.app_source = Source::identify(&app_id);
+            if self.app_source == Source::Other
+                && let Ok(name) = AppInfo::GetFromAppUserModelId(&app_id.as_str().into())
+                    .and_then(|info| info.DisplayInfo())
+                    .and_then(|display| display.DisplayName())
+            {
+                self.app_source = self
+                    .app_source
+                    .with_registered_name(&name.to_string_lossy());
+            }
+            self.app_id = Some(app_id);
+        }
+        let app = self.app_source;
         let info = session.GetPlaybackInfo()?;
         let status = info.PlaybackStatus()?;
         self.local_playing = match status {
@@ -420,110 +626,140 @@ impl Sessions {
             Playback::Paused => Some(false),
             _ => None,
         };
-        let playback_type = info.PlaybackType().and_then(|kind| kind.Value()).ok();
-        if source == Source::Other
-            || self.local_playing.is_none()
-            || (source == Source::NetEase
-                && playback_type.is_some_and(|t| t != MediaPlaybackType::Music))
+        let info_type = info.PlaybackType().and_then(|kind| kind.Value()).ok();
+        if self.local_playing.is_none() {
+            self.source = Some(app.for_playback(info_type, None));
+            self.revoke();
+            return Ok(None);
+        }
+        let properties = if app == Source::MusicApp
+            && info_type.is_none_or(|kind| kind == MediaPlaybackType::Music)
         {
-            self.consent = None;
-            return Ok(None);
-        }
-        self.eligible = true;
-        if self.consent.as_ref().is_some_and(|c| {
-            c.source_id != app_id
-                || c.session != session
-                || answer
-                    .as_ref()
-                    .is_some_and(|(id, input)| *id == c.id && input.is_none())
-                || !c.permit.valid()
-                || (c.lookup.is_none() && c.offered_at.elapsed() > Duration::from_secs(90))
-        }) {
-            self.consent = None;
-        }
-        if request {
-            self.consent = None;
-            let item = Arc::new(AtomicU64::new(0));
-            let changes = Arc::clone(&item);
-            let token = session.MediaPropertiesChanged(&TypedEventHandler::new(move |_, _| {
-                changes.fetch_add(1, Ordering::AcqRel);
-                Ok(())
-            }))?;
-            self.consent = Some(TrackConsent {
-                id: NEXT_OFFER.fetch_add(1, Ordering::Relaxed),
-                key: None,
-                source_id: app_id,
-                lookup: None,
-                offered_at: Instant::now(),
-                permit: LookupPermit {
-                    current: Arc::clone(&self.current),
-                    current_revision,
-                    item,
-                    item_revision: 0,
-                },
-                session: session.clone(),
-                token,
-            });
-        }
-        let Some(consent) = self.consent.as_mut() else {
-            return Ok(None);
+            Some(finish(session.TryGetMediaPropertiesAsync()?)?)
+        } else {
+            None
         };
-        let submission = answer.and_then(|(id, fields)| fields.map(|fields| (id, fields)));
-        if !may_read_item(
-            request,
-            consent.lookup.is_some(),
-            consent.id,
-            submission.as_ref().map(|(id, _)| *id),
-        ) {
+        let item_type = properties
+            .as_ref()
+            .and_then(|item| item.PlaybackType().and_then(|kind| kind.Value()).ok());
+        let source = app.for_playback(info_type, item_type);
+        self.source = Some(source);
+        let mode = source.lookup_mode(auto);
+        self.eligible = mode == LookupMode::Manual;
+        if mode == LookupMode::AwaitChoice {
+            self.revoke();
             return Ok(None);
         }
-        let metadata = finish(consent.session.TryGetMediaPropertiesAsync()?)?;
-        if source == Source::NetEase {
-            let kind = metadata.PlaybackType().and_then(|t| t.Value()).ok();
-            if kind.or(playback_type) != Some(MediaPlaybackType::Music) {
-                self.eligible = false;
-                self.consent = None;
-                return Ok(None);
-            }
+        let automatic = mode == LookupMode::Automatic;
+        let cancelled = answer.as_ref().is_some_and(|(id, input)| {
+            input.is_none() && self.track.as_ref().is_some_and(|track| track.id == *id)
+        });
+        if cancelled
+            || self.track.as_ref().is_some_and(|track| {
+                !track.permit.valid() || track.automatic != automatic || track.source != source
+            })
+            || self.consent.as_ref().is_some_and(|consent| {
+                consent.lookup.is_none() && consent.offered_at.elapsed() > Duration::from_secs(90)
+            })
+        {
+            self.revoke();
         }
+        if !automatic && !request && self.consent.is_none() {
+            if self.cover_changed {
+                self.notice_deadline = Some(Instant::now() + Duration::from_millis(3450));
+            }
+            return Ok(None);
+        }
+        let metadata = match properties {
+            Some(item) => item,
+            None => finish(session.TryGetMediaPropertiesAsync()?)?,
+        };
         let title = metadata.Title()?.to_string_lossy();
-        if !valid_session_title(&title) || !consent.permit.valid() {
-            self.consent = None;
+        if !valid_session_title(&title) {
+            self.revoke();
             return Ok(None);
         }
         let mut artist = metadata.Artist()?.to_string_lossy();
-        if source == Source::NetEase && artist.trim().is_empty() {
+        if source == Source::MusicApp && artist.trim().is_empty() {
             artist = metadata.AlbumArtist().unwrap_or_default().to_string_lossy();
         }
         let key = TrackKey {
-            title: title.clone(),
+            title,
             artist,
             album: metadata.AlbumTitle()?.to_string_lossy(),
             number: metadata.TrackNumber()?,
         };
-        if request {
-            consent.key = Some(key);
+        if self.current.load(Ordering::Acquire) != current_revision {
+            self.revoke();
+            self.rechecking = true;
             return Ok(None);
         }
-        if consent.key.as_ref() != Some(&key) {
-            self.consent = None;
+        if self.needs_refresh() {
+            self.deferred_action = Some((request, answer));
+            self.rechecking = true;
             return Ok(None);
         }
-        if let Some((id, (title, artist))) = submission
-            && id == consent.id
-            && consent.lookup.is_none()
-        {
-            if !valid_lookup_input(&title, &artist) {
-                self.consent = None;
+        if self.track.as_ref().is_some_and(|track| track.key != key) {
+            self.notice_deadline = Some(Instant::now() + Duration::from_millis(3450));
+        }
+        match ActiveTrack::observe(
+            &mut self.track,
+            key,
+            source,
+            mode,
+            request,
+            &self.current,
+            current_revision,
+        ) {
+            TrackChange::Same => {}
+            TrackChange::Automatic => self.consent = None,
+            TrackChange::Inactive => {
+                self.revoke();
                 return Ok(None);
             }
-            consent.lookup = Some(LookupInput { title, artist });
+            TrackChange::Offer => {
+                self.cover = None;
+                self.consent = Some(TrackConsent {
+                    lookup: None,
+                    offered_at: Instant::now(),
+                });
+                return Ok(None);
+            }
         }
-        let Some(lookup) = consent.lookup.as_ref() else {
-            return Ok(None);
+        let track = self.track.as_ref().unwrap();
+        let key = &track.key;
+        let automatic_input;
+        let lookup = if automatic {
+            let title = key.title.trim();
+            if !eligible_title(title) {
+                return Ok(None);
+            }
+            automatic_input = LookupInput {
+                title: title.to_owned(),
+                artist: String::new(),
+            };
+            &automatic_input
+        } else {
+            let Some(consent) = self.consent.as_mut() else {
+                return Ok(None);
+            };
+            if let Some((id, Some((title, artist)))) = answer
+                && id == track.id
+                && consent.lookup.is_none()
+            {
+                if !valid_lookup_input(&title, &artist) {
+                    self.revoke();
+                    return Ok(None);
+                }
+                consent.lookup = Some(LookupInput { title, artist });
+            }
+            let Some(lookup) = &consent.lookup else {
+                return Ok(None);
+            };
+            lookup
         };
-        let permit = consent.permit.clone();
-        let id = consent.id;
+        let permit = track.permit.clone();
+        let id = track.id;
         self.cover = metadata.Thumbnail().ok();
         let rate = info
             .PlaybackRate()
@@ -556,13 +792,13 @@ impl Sessions {
             }
         }
         if !permit.valid() {
-            self.consent = None;
-            self.cover = None;
+            self.revoke();
+            self.rechecking = true;
             return Ok(None);
         }
         let media = Media {
             song: Song {
-                title: wallpaper_title(&title),
+                title: wallpaper_title(&key.title),
                 artist: String::new(),
                 source,
             },
@@ -572,9 +808,15 @@ impl Sessions {
             rate,
             sent,
         };
-        let lookup_media = lookup.media(&media, &title, &key.artist);
+        let lookup_media = lookup.media(&media, &key.title, &key.artist);
+        let display_artist = if key.artist.trim().is_empty() {
+            metadata.AlbumArtist().unwrap_or_default().to_string_lossy()
+        } else {
+            key.artist.clone()
+        };
         Ok(Some(ApprovedTrack {
             media,
+            display_artist: wallpaper_title(&display_artist),
             permit,
             id,
             lookup_media,
@@ -608,11 +850,62 @@ mod tests {
             Source::Browser
         );
         assert_eq!(Source::identify("MSEdge"), Source::Browser);
-        assert_eq!(Source::identify("CloudMusic.exe"), Source::NetEase);
+        assert_eq!(Source::identify("CloudMusic.exe"), Source::MusicApp);
         assert_eq!(
             Source::identify("1f8b0f94.122165ae053f_j2p0p5q0044a6!App"),
-            Source::NetEase
+            Source::MusicApp
         );
+    }
+
+    #[test]
+    fn registered_application_names_can_only_identify_a_manual_video_source() {
+        for name in ["哔哩哔哩", "嗶哩嗶哩", "BiliBili"] {
+            assert_eq!(Source::Other.with_registered_name(name), Source::Browser);
+        }
+        for name in [
+            "",
+            "Bilibili 插件",
+            "音乐 - bilibili",
+            "网易云音乐",
+            "CloudMusic.exe",
+        ] {
+            assert_eq!(Source::Other.with_registered_name(name), Source::Other);
+        }
+        assert_eq!(
+            Source::MusicApp.with_registered_name("Bilibili"),
+            Source::MusicApp
+        );
+    }
+
+    #[test]
+    fn only_explicit_music_from_the_allowlist_can_use_automatic_lookup() {
+        use MediaPlaybackType as Kind;
+        for (info, item, expected) in [
+            (None, None, Source::Browser),
+            (Some(Kind::Music), None, Source::MusicApp),
+            (None, Some(Kind::Music), Source::MusicApp),
+            (Some(Kind::Music), Some(Kind::Video), Source::Browser),
+            (Some(Kind::Video), Some(Kind::Music), Source::Browser),
+            (None, Some(Kind::Unknown), Source::Browser),
+        ] {
+            assert_eq!(Source::MusicApp.for_playback(info, item), expected);
+            assert_eq!(Source::Browser.for_playback(info, item), Source::Browser);
+            assert_eq!(Source::Other.for_playback(info, item), Source::Other);
+        }
+        assert_eq!(Source::MusicApp.lookup_mode(None), LookupMode::AwaitChoice);
+        assert_eq!(
+            Source::MusicApp.lookup_mode(Some(false)),
+            LookupMode::Manual
+        );
+        assert_eq!(
+            Source::MusicApp.lookup_mode(Some(true)),
+            LookupMode::Automatic
+        );
+        for choice in [None, Some(false), Some(true)] {
+            for source in [Source::Browser, Source::Other] {
+                assert_eq!(source.lookup_mode(choice), LookupMode::Manual);
+            }
+        }
     }
 
     #[test]
@@ -634,7 +927,7 @@ mod tests {
     }
 
     #[test]
-    fn long_browser_identifiers_never_prefill_a_lookup() {
+    fn manual_prefill_is_a_visible_editable_song_candidate() {
         let original = format!("私有媒体编号\n{}", "甲".repeat(1000));
         assert!(valid_session_title(&original));
         assert!(valid_session_title(&"雨".repeat(4096)));
@@ -642,10 +935,21 @@ mod tests {
         assert!(!valid_lookup_input(&original, ""));
         assert!(!valid_lookup_input("Silver Meadow", "bad\nartist"));
         assert!(valid_lookup_input("Silver Meadow", ""));
-        assert_eq!(suggested_title(Source::Browser, "原视频"), "");
-        assert_eq!(suggested_title(Source::NetEase, &original), "");
+        use crate::lookup::suggested_title;
+        assert_eq!(suggested_title("原视频", Source::Browser), "原视频");
+        for source in [Source::Browser, Source::Other] {
+            assert_eq!(
+                suggested_title("【高音质】演奏《窗前雨》 | 哔哩哔哩", source),
+                "窗前雨"
+            );
+            assert_eq!(
+                suggested_title("歌手 - Silver Meadow | bilibili", source),
+                "Silver Meadow"
+            );
+        }
+        assert_eq!(suggested_title(&original, Source::MusicApp), "");
         assert_eq!(
-            suggested_title(Source::NetEase, "Silver Meadow"),
+            suggested_title("Silver Meadow", Source::MusicApp),
             "Silver Meadow"
         );
         assert_eq!(
@@ -687,12 +991,254 @@ mod tests {
     }
 
     #[test]
-    fn lookup_requires_a_matching_decision_and_expires_on_both_windows_events() {
-        assert!(!may_read_item(false, false, 5, None));
-        assert!(!may_read_item(false, false, 5, Some(4)));
-        assert!(may_read_item(true, false, 5, None));
-        assert!(may_read_item(false, false, 5, Some(5)));
-        assert!(may_read_item(false, true, 5, None));
+    fn track_identity_survives_seek_or_late_art_and_rejects_changed_fields() {
+        let key = TrackKey {
+            title: "曲".into(),
+            artist: "歌手".into(),
+            album: "专辑".into(),
+            number: 4,
+        };
+        let session_revision = Arc::new(AtomicU64::new(3));
+        let track = ActiveTrack::new(key.clone(), Source::Browser, false, &session_revision, 3);
+        let queued = track.permit.clone();
+        assert!(track.matches(&key, Source::Browser, false));
+        for changed in [
+            TrackKey {
+                title: "新曲".into(),
+                ..key.clone()
+            },
+            TrackKey {
+                artist: "另一位".into(),
+                ..key.clone()
+            },
+            TrackKey {
+                album: "另一版".into(),
+                ..key.clone()
+            },
+            TrackKey {
+                number: 5,
+                ..key.clone()
+            },
+        ] {
+            assert!(!track.matches(&changed, Source::Browser, false));
+        }
+        assert!(!track.matches(&key, Source::MusicApp, true));
+        assert!(queued.valid());
+        drop(track);
+        assert!(!queued.valid());
+    }
+
+    #[test]
+    #[ignore = "explicit local SMTC browser acceptance using RAIN_NIGHT_VERIFY_BROWSER=1"]
+    fn live_browser_keeps_automatic_lookup_off_and_prefills_manual_offer() {
+        if std::env::var_os("RAIN_NIGHT_VERIFY_BROWSER").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        {
+            return;
+        }
+        let _apartment = Apartment::open().expect("Windows Runtime unavailable");
+        let mut sessions = Sessions::open().expect("Windows media control unavailable");
+        let approved = sessions
+            .current(false, None, Some(true))
+            .expect("session inspection failed");
+        assert!(
+            approved.is_none() && sessions.offer().is_none(),
+            "automatic lookup was offered"
+        );
+        assert!(
+            sessions.source == Some(Source::Browser) && sessions.eligible,
+            "an active browser media session is required"
+        );
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut request = true;
+        loop {
+            let approved = sessions
+                .current(request, None, Some(true))
+                .expect("manual offer failed");
+            request = false;
+            assert!(
+                approved.is_none(),
+                "manual request granted without confirmation"
+            );
+            if let Some((_, candidate)) = sessions.offer() {
+                let nonempty = !candidate.is_empty();
+                println!("browser_auto_disabled=true; manual_candidate_nonempty={nonempty}");
+                assert!(
+                    nonempty && eligible_title(&candidate),
+                    "no eligible song candidate"
+                );
+                break;
+            }
+            assert!(
+                sessions.rechecking && Instant::now() < deadline,
+                "no current manual offer"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        sessions.revoke();
+    }
+
+    #[test]
+    #[ignore = "explicit live browser song switch with RAIN_NIGHT_VERIFY_BROWSER_SWITCH=1"]
+    fn live_browser_change_expires_previous_manual_lookup() {
+        if std::env::var_os("RAIN_NIGHT_VERIFY_BROWSER_SWITCH").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        {
+            return;
+        }
+        fn read(
+            sessions: &mut Sessions,
+            request: bool,
+            answer: Option<LookupAnswer>,
+        ) -> Option<ApprovedTrack> {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            let mut result = sessions
+                .current(request, answer, Some(true))
+                .expect("browser inspection failed");
+            while sessions.rechecking {
+                assert!(Instant::now() < deadline, "unstable browser media session");
+                thread::sleep(Duration::from_millis(25));
+                result = sessions
+                    .current(false, None, Some(true))
+                    .expect("browser recheck failed");
+            }
+            result
+        }
+        let _apartment = Apartment::open().expect("Windows Runtime unavailable");
+        let mut sessions = Sessions::open().expect("Windows media control unavailable");
+        assert!(read(&mut sessions, false, None).is_none());
+        assert!(
+            sessions.source == Some(Source::Browser) && sessions.eligible,
+            "active browser required"
+        );
+        let original_app = sessions.app_id.clone();
+        assert!(read(&mut sessions, true, None).is_none());
+        let (mut id, _) = sessions.offer().expect("manual offer required");
+        let key = sessions
+            .track
+            .as_ref()
+            .expect("missing local track identity")
+            .key
+            .clone();
+        let answer = |id| Some((id, Some(("离线验收".to_owned(), String::new()))));
+        let mut first =
+            read(&mut sessions, false, answer(id)).expect("initial manual approval failed");
+        println!("browser_switch_probe_armed=true");
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while Instant::now() < deadline {
+            thread::park_timeout(Duration::from_millis(180));
+            if let Some(active) = read(&mut sessions, false, None) {
+                assert!(
+                    active.id == id && first.permit.valid(),
+                    "unexpected automatic grant"
+                );
+                continue;
+            }
+            if sessions.source != Some(Source::Browser)
+                || sessions.app_id != original_app
+                || !sessions.eligible
+            {
+                continue;
+            }
+            assert!(!first.permit.valid() && sessions.offer().is_none());
+            assert!(
+                read(&mut sessions, false, answer(id)).is_none(),
+                "old answer granted access"
+            );
+            assert!(
+                read(&mut sessions, true, None).is_none(),
+                "manual request granted before confirmation"
+            );
+            let Some((new_id, _)) = sessions.offer() else {
+                continue;
+            };
+            assert!(id != new_id);
+            if sessions
+                .track
+                .as_ref()
+                .is_some_and(|track| track.key != key)
+            {
+                println!(
+                    "browser_track_changed=true; old_grant_revoked=true; new_confirmation_required=true"
+                );
+                return;
+            }
+            id = new_id;
+            first = read(&mut sessions, false, answer(id)).expect("same-item recheck failed");
+        }
+        panic!("no distinct active browser track observed in two minutes");
+    }
+
+    #[test]
+    fn five_tracks_switch_directly_in_automatic_mode_and_revoke_manual_offers() {
+        let generation = Arc::new(AtomicU64::new(7));
+        for (source, choice, expected) in [
+            (Source::MusicApp, Some(true), LookupMode::Automatic),
+            (Source::MusicApp, None, LookupMode::AwaitChoice),
+            (Source::MusicApp, Some(false), LookupMode::Manual),
+            (Source::Browser, Some(true), LookupMode::Manual),
+            (Source::Other, Some(true), LookupMode::Manual),
+        ] {
+            let mode = source.lookup_mode(choice);
+            assert_eq!(mode, expected);
+            let mut current: Option<ActiveTrack> = None;
+            for number in 1..=5 {
+                let key = TrackKey {
+                    title: format!("合成曲{number}"),
+                    artist: "演奏者".into(),
+                    album: "合成单元测试".into(),
+                    number,
+                };
+                let previous = current.as_ref().map(|t| (t.id, t.permit.clone()));
+                let next = ActiveTrack::observe(
+                    &mut current,
+                    key.clone(),
+                    source,
+                    mode,
+                    false,
+                    &generation,
+                    7,
+                );
+                if mode == LookupMode::Automatic {
+                    assert_eq!(next, TrackChange::Automatic);
+                    assert!(current.as_ref().unwrap().automatic);
+                } else {
+                    assert_eq!(next, TrackChange::Inactive);
+                    assert!(current.is_none());
+                    let requested = ActiveTrack::observe(
+                        &mut current,
+                        key.clone(),
+                        source,
+                        mode,
+                        true,
+                        &generation,
+                        7,
+                    );
+                    if mode == LookupMode::AwaitChoice {
+                        assert_eq!(requested, TrackChange::Inactive);
+                        assert!(current.is_none());
+                        continue;
+                    }
+                    assert_eq!(requested, TrackChange::Offer);
+                    assert!(!current.as_ref().unwrap().automatic);
+                }
+                let id = current.as_ref().unwrap().id;
+                if let Some((old, permit)) = previous {
+                    assert_ne!(id, old);
+                    assert!(!permit.valid());
+                }
+                assert_eq!(
+                    ActiveTrack::observe(&mut current, key, source, mode, false, &generation, 7),
+                    TrackChange::Same
+                );
+                assert_eq!(current.as_ref().unwrap().id, id);
+                assert!(current.as_ref().unwrap().permit.valid());
+            }
+        }
+    }
+
+    #[test]
+    fn queued_lookup_expires_on_session_change_or_track_revocation() {
         for current_changed in [true, false] {
             let permit = LookupPermit {
                 current: Arc::new(AtomicU64::new(3)),

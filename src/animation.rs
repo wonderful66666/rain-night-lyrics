@@ -112,6 +112,14 @@ pub struct Pose {
     pub breath: f32,
 }
 
+impl Pose {
+    pub fn keep_dock_clearance(&mut self) {
+        let radius = 22.0;
+        self.dx = self.dx.max(radius * (self.scale.0 - 1.0));
+        self.dy = self.dy.max(radius * (self.scale.1 - 1.0));
+    }
+}
+
 impl Anim {
     pub fn new(reduced: bool) -> Self {
         Self {
@@ -285,18 +293,26 @@ impl Anim {
         }
         p
     }
-    pub fn animating(&self, t: f64, has_media: bool) -> bool {
+    pub fn frame_rate(&self, t: f64, has_media: bool, moving: bool, hz: f64) -> Option<f64> {
         let dt = t - self.width_at;
         let tip_wait = self.hover_at.map(|s| s + 0.5 - t);
-        self.closing.is_some()
+        let transition = moving
+            || self.closing.is_some()
             || t < if self.reduced { 0.2 } else { 0.880 }
             || (!self.reduced
                 && ((0.0..EXPAND).contains(&dt)
                     || (0.0..0.760).contains(&(t - self.ripple_at))
                     || tip_wait.is_some_and(|v| (-0.180..=0.0).contains(&v))
-                    || t < self.spin.start + self.spin.span
-                    || !has_media
-                    || self.spin.to > 0.0))
+                    || t < self.spin.start + self.spin.span));
+        if transition {
+            Some(hz)
+        } else if !self.reduced && self.spin.to > 0.0 {
+            Some(hz.min(60.0))
+        } else if !self.reduced && !has_media {
+            Some(hz.min(24.0))
+        } else {
+            None
+        }
     }
 
     pub fn hint_deadline(&self, t: f64) -> Option<f64> {
@@ -307,6 +323,21 @@ impl Anim {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn docked_body_keeps_its_left_and_top_edges_during_entrance_and_exit() {
+        let mut anim = Anim::new(false);
+        for frame in 0..600 {
+            let t = frame as f64 / 240.0;
+            if frame == 240 {
+                anim.close(t);
+            }
+            let mut pose = anim.pose(t);
+            pose.keep_dock_clearance();
+            assert!(pose.dx + 22.0 * (1.0 - pose.scale.0) >= -1e-5);
+            assert!(pose.dy + 22.0 * (1.0 - pose.scale.1) >= -1e-5);
+        }
+    }
+
     #[test]
     fn easing_preserves_endpoints_and_overshoot() {
         assert_eq!(bezier(0.0, 0.2, 0.9, 0.25, 1.12), 0.0);
@@ -337,9 +368,24 @@ mod tests {
         a.playback(false, 5.0);
         assert_eq!(a.pose(5.0).angle, angle);
         assert_eq!(a.pose(6.0).angle, a.pose(10.0).angle);
-        assert!(!a.animating(10.0, true));
+        assert_eq!(a.frame_rate(10.0, true, false, 240.0), None);
         a.playback(true, 10.0);
         assert_eq!(a.pose(10.0).angle, a.pose(10.001).angle);
+    }
+    #[test]
+    fn steady_rotation_is_capped_but_transitions_follow_the_display() {
+        for hz in [48., 144., 240.] {
+            let mut a = Anim::new(false);
+            a.playback(true, 1.);
+            assert_eq!(a.frame_rate(1.1, true, false, hz), Some(hz));
+            assert_eq!(a.frame_rate(2., true, false, hz), Some(hz.min(60.)));
+            assert_eq!(a.frame_rate(2., true, true, hz), Some(hz));
+            a.set_expanded(true, 2.);
+            assert_eq!(a.frame_rate(2.1, true, false, hz), Some(hz));
+            a.playback(false, 3.);
+            assert_eq!(a.frame_rate(3.15, true, false, hz), Some(hz));
+            assert_eq!(a.frame_rate(5., true, false, hz), None);
+        }
     }
     #[test]
     fn display_deadlines_keep_phase_after_a_late_frame() {

@@ -4,6 +4,7 @@ use regex::Regex;
 use serde::Serialize;
 use std::fmt::Write;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 const LIMIT: usize = 20_000;
 const PACKET_BYTES: usize = LIMIT / 4 * 3;
@@ -105,8 +106,7 @@ impl Lyrics {
             provider,
         })
     }
-    fn at(&self, m: &Media) -> i64 {
-        let mut p = m.position.unwrap_or_default();
+    fn loop_period(&self, m: &Media) -> Option<f64> {
         let title = m.song.title.to_lowercase();
         if self.duration > 0.0
             && m.duration > self.duration * 1.55
@@ -114,14 +114,54 @@ impl Lyrics {
         {
             let period = m.duration / (m.duration / self.duration).round();
             if (period - self.duration).abs() < self.duration * 0.04 {
-                p %= period;
+                return Some(period);
             }
         }
-        (p * 1000.0) as i64
+        None
+    }
+    fn cue_clock(&self, m: &Media, delay: i64) -> i64 {
+        let mut position = m.position.unwrap_or_default() + delay as f64 / 1000.0;
+        if position >= 0.0
+            && let Some(period) = self.loop_period(m)
+        {
+            position %= period;
+        }
+        (position * 1000.0).floor() as i64
+    }
+    fn at(&self, m: &Media) -> i64 {
+        self.cue_clock(m, 0)
+    }
+    pub fn next_layout_change(&self, m: &Media, delay: i64) -> Option<Duration> {
+        let position = m.position?;
+        if !m.playing
+            || !m.rate.is_finite()
+            || m.rate <= 0.0
+            || (m.duration > 0.0 && position >= m.duration)
+        {
+            return None;
+        }
+        let at = self.cue_clock(m, delay);
+        let end = self.main.partition_point(|cue| cue.ms <= at);
+        let next = self.main.get(end).map(|c| c.ms);
+        let rest = end
+            .checked_sub(1)
+            .map(|i| self.main[i].ms)
+            .and_then(|last| {
+                let silence = last + 9001;
+                (silence > at && next.is_none_or(|n| n - last > 12000)).then_some(silence)
+            });
+        let wrap = self.loop_period(m).map(|p| (p * 1000.0).ceil() as i64);
+        let boundary = [next, rest, wrap]
+            .into_iter()
+            .flatten()
+            .filter(|b| *b > at)
+            .min()?;
+        let ticks = ((boundary - at) as f64 / m.rate).ceil();
+        Some(Duration::from_millis((ticks as u64).max(1)))
     }
     pub fn displayed(&self, m: &Media, delay: i64) -> Option<(&str, &str)> {
         m.position?;
-        let at = self.at(m) + delay;
+        let at = self.cue_clock(m, delay);
         let end = self.main.partition_point(|cue| cue.ms <= at);
         let cue = self.main.get(end.checked_sub(1)?)?;
         if cue.text.is_empty()
@@ -313,6 +353,55 @@ mod tests {
         assert_eq!(words.displayed(&m, 0), None);
     }
     #[test]
+    fn layout_deadlines_follow_rate_delay_silence_and_loop_boundaries() {
+        let words = Lyrics::new(
+            "曲",
+            24.0,
+            "[00:02]短句\n[00:20]一行更长的歌词",
+            "[00:20]译文",
+            "测试",
+        )
+        .unwrap();
+        let mut media = Media::anonymous(true);
+        media.duration = 24.0;
+        media.position = Some(1.0);
+        media.rate = 2.0;
+        assert_eq!(
+            words.next_layout_change(&media, 250),
+            Some(Duration::from_millis(375))
+        );
+        media.position = Some(11.0);
+        assert_eq!(
+            words.next_layout_change(&media, 0),
+            Some(Duration::from_millis(1))
+        );
+        media.position = Some(12.0);
+        assert_eq!(words.displayed(&media, 0), None);
+        assert_eq!(
+            words.next_layout_change(&media, 0),
+            Some(Duration::from_secs(4))
+        );
+        media.playing = false;
+        assert_eq!(words.next_layout_change(&media, 0), None);
+        media.playing = true;
+        media.song.title = "曲 loop".into();
+        media.duration = 48.0;
+        media.position = Some(23.5);
+        assert_eq!(words.displayed(&media, 0), Some(("一行更长的歌词", "译文")));
+        assert_eq!(
+            words.next_layout_change(&media, 250),
+            Some(Duration::from_millis(125))
+        );
+        media.position = Some(23.75);
+        assert_eq!(words.displayed(&media, 250), None);
+        assert_eq!(
+            words.next_layout_change(&media, 250),
+            Some(Duration::from_secs(1))
+        );
+        media.position = Some(48.0);
+        assert_eq!(words.next_layout_change(&media, 0), None);
+    }
+    #[test]
     fn timestamps_offset_and_multiple_stamps() {
         let c = cues("[offset:150]\n[00:01.5][01:20.324]雨\n[00:02]停").unwrap();
         assert_eq!(
@@ -346,7 +435,7 @@ mod tests {
             song: Song {
                 title: "\0".repeat(20_000),
                 artist: "🌂".repeat(20_000),
-                source: Source::NetEase,
+                source: Source::MusicApp,
             },
             position: Some(5.0),
             duration: 80.0,

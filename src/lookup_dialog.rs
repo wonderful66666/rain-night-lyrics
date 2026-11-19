@@ -9,9 +9,11 @@ use windows::core::{HSTRING, Result};
 
 const TITLE: i32 = 101;
 const ARTIST: i32 = 102;
+const AUTO_ACCEPT: i32 = 103;
+const AUTO_BODY: i32 = 104;
 const ANSWER: u32 = WM_APP + 51;
 
-fn template() -> Vec<u32> {
+fn template(automatic: bool) -> Vec<u32> {
     fn string(words: &mut Vec<u16>, value: &str) {
         words.extend(value.encode_utf16().chain([0]));
     }
@@ -23,12 +25,24 @@ fn template() -> Vec<u32> {
     let mut words = Vec::new();
     dword(&mut words, style);
     dword(&mut words, 0);
-    words.extend([7, 0, 0, 282, 143, 0, 0]);
-    string(&mut words, "查找这一首的歌词");
+    let (controls, width, height) = if automatic {
+        (3, 308, 118)
+    } else {
+        (7, 282, 143)
+    };
+    words.extend([controls, 0, 0, width, height, 0, 0]);
+    string(
+        &mut words,
+        if automatic {
+            "要自动查歌词吗？"
+        } else {
+            "查找这一首的歌词"
+        },
+    );
     words.push(9);
     string(&mut words, "Microsoft YaHei UI");
     let edit = WS_TABSTOP.0 | WS_BORDER.0 | ES_AUTOHSCROLL as u32;
-    let controls = [
+    let manual_controls = [
         (
             0x82,
             0xffff,
@@ -67,7 +81,35 @@ fn template() -> Vec<u32> {
             "查这一首",
         ),
     ];
-    for (class, id, rect, style, label) in controls {
+    let automatic_controls = [
+        (
+            0x82,
+            AUTO_BODY as u16,
+            [12, 10, 284, 66],
+            0,
+            "你用音乐软件听歌时，取词器可以自动把歌名和歌手发给网易云曲库或 LRCLIB，查到后显示在壁纸上。浏览器里的视频标题不会自动发送。\r\n\r\n这个选择随时可以在圆圈的右键菜单里修改。",
+        ),
+        (
+            0x80,
+            AUTO_ACCEPT as u16,
+            [164, 84, 62, 20],
+            WS_TABSTOP.0,
+            "自动查词",
+        ),
+        (
+            0x80,
+            IDCANCEL.0 as u16,
+            [234, 84, 62, 20],
+            WS_TABSTOP.0,
+            "暂不",
+        ),
+    ];
+    let controls: &[_] = if automatic {
+        &automatic_controls
+    } else {
+        &manual_controls
+    };
+    for &(class, id, rect, style, label) in controls {
         if !words.len().is_multiple_of(2) {
             words.push(0);
         }
@@ -115,7 +157,8 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wparam: WPARAM, _: L
                 }
                 return 1;
             }
-            if notification != BN_CLICKED || (id != IDCANCEL.0 && id != IDOK.0) {
+            if notification != BN_CLICKED || (id != IDCANCEL.0 && id != IDOK.0 && id != AUTO_ACCEPT)
+            {
                 return 0;
             }
             id
@@ -128,13 +171,36 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wparam: WPARAM, _: L
 
 pub struct LookupDialog {
     hwnd: HWND,
-    id: u64,
+    id: Option<u64>,
     bridge: Arc<UiBridge>,
 }
 
 impl LookupDialog {
     pub fn open(owner: HWND, id: u64, title: &str, bridge: Arc<UiBridge>) -> Result<Self> {
-        let layout = template();
+        let dialog = Self::create(owner, Some(id), bridge)?;
+        if !title.is_empty() && valid_lookup_input(title, "") {
+            unsafe { SetDlgItemTextW(dialog.hwnd, TITLE, &HSTRING::from(title))? };
+        }
+        Ok(dialog)
+    }
+    pub fn automatic(owner: HWND, bridge: Arc<UiBridge>) -> Result<Self> {
+        let dialog = Self::create(owner, None, bridge)?;
+        unsafe {
+            SendMessageW(dialog.hwnd, DM_SETDEFID, WPARAM(0), LPARAM(0));
+            for id in [AUTO_ACCEPT, IDCANCEL.0] {
+                let button = GetDlgItem(dialog.hwnd, id)?;
+                SendMessageW(
+                    button,
+                    BM_SETSTYLE,
+                    WPARAM(BS_PUSHBUTTON as usize),
+                    LPARAM(0),
+                );
+            }
+        }
+        Ok(dialog)
+    }
+    fn create(owner: HWND, id: Option<u64>, bridge: Arc<UiBridge>) -> Result<Self> {
+        let layout = template(id.is_none());
         let module = unsafe { GetModuleHandleW(None)? };
         let hwnd = unsafe {
             CreateDialogIndirectParamW(
@@ -145,25 +211,26 @@ impl LookupDialog {
                 LPARAM(0),
             )?
         };
-        let dialog = Self { hwnd, id, bridge };
-        if !title.is_empty() && valid_lookup_input(title, "") {
-            unsafe { SetDlgItemTextW(hwnd, TITLE, &HSTRING::from(title))? };
-        }
-        Ok(dialog)
+        Ok(Self { hwnd, id, bridge })
     }
 
     pub fn show(&self) {
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNORMAL);
             let _ = SetForegroundWindow(self.hwnd);
-            if let Ok(edit) = GetDlgItem(self.hwnd, TITLE) {
-                let _ = SetFocus(edit);
+            if let Ok(control) =
+                GetDlgItem(self.hwnd, if self.id.is_some() { TITLE } else { AUTO_BODY })
+            {
+                let _ = SetFocus(control);
             }
         }
     }
 
     pub fn current(&self) -> bool {
-        self.bridge.lookup_offer_is_current(self.id)
+        self.id.map_or_else(
+            || self.bridge.ask_auto_pending(),
+            |id| self.bridge.lookup_offer_is_current(id),
+        )
     }
 
     pub fn handle(&self, message: &MSG) -> bool {
@@ -172,12 +239,22 @@ impl LookupDialog {
         }
         if message.hwnd == self.hwnd && message.message == ANSWER {
             if self.current() {
-                if message.wParam.0 == IDOK.0 as usize {
-                    if let Some(answer) = fields(self.hwnd) {
-                        self.bridge.answer_lookup(self.id, Some(answer));
+                if let Some(id) = self.id {
+                    if message.wParam.0 == IDOK.0 as usize {
+                        if let Some(answer) = fields(self.hwnd) {
+                            self.bridge.answer_lookup(id, Some(answer));
+                        }
+                    } else if message.wParam.0 == IDCANCEL.0 as usize {
+                        self.bridge.answer_lookup(id, None);
                     }
-                } else if message.wParam.0 == IDCANCEL.0 as usize {
-                    self.bridge.answer_lookup(self.id, None);
+                } else if message.wParam.0 == AUTO_ACCEPT as usize
+                    || message.wParam.0 == IDCANCEL.0 as usize
+                {
+                    save_choice(
+                        self.hwnd,
+                        &self.bridge,
+                        message.wParam.0 == AUTO_ACCEPT as usize,
+                    );
                 }
             }
             return true;
@@ -188,8 +265,23 @@ impl LookupDialog {
 
 impl Drop for LookupDialog {
     fn drop(&mut self) {
-        self.bridge.answer_lookup(self.id, None);
+        if let Some(id) = self.id {
+            self.bridge.answer_lookup(id, None);
+        }
         let _ = unsafe { DestroyWindow(self.hwnd) };
+    }
+}
+
+pub fn save_choice(hwnd: HWND, bridge: &UiBridge, enabled: bool) {
+    if bridge.choose_auto(enabled).is_err() {
+        unsafe {
+            let _ = MessageBoxW(
+                hwnd,
+                windows::core::w!("无法保存设置，请检查设置目录的写入权限。"),
+                windows::core::w!("雨夜轻息取词器"),
+                MB_OK | MB_ICONERROR,
+            );
+        }
     }
 }
 
@@ -234,6 +326,66 @@ mod tests {
             bridge.take_lookup_answer(),
             Some((1, Some(("Silver Meadow".into(), "Nerai".into()))))
         );
+    }
+
+    #[test]
+    fn automatic_dialog_needs_an_explicit_click_and_records_close_as_declined() {
+        for choice in [Some(true), Some(false), None] {
+            let dir = std::env::temp_dir().join(format!(
+                "rain-night-auto-dialog-{}-{choice:?}",
+                std::process::id()
+            ));
+            let bridge = Arc::new(UiBridge::with_settings_dir(dir.clone()));
+            bridge.set_lookup_context(false, true, true);
+            assert!(!bridge.can_request_lookup());
+            let dialog = LookupDialog::automatic(HWND::default(), Arc::clone(&bridge)).unwrap();
+            assert_eq!(bridge.auto_policy().0, None);
+            let revision = bridge.auto_revision();
+            let initial = bridge.auto_policy().1;
+            unsafe {
+                let ok = GetDlgItem(dialog.hwnd, AUTO_ACCEPT).unwrap();
+                let no = GetDlgItem(dialog.hwnd, IDCANCEL.0).unwrap();
+                for button in [ok, no] {
+                    assert_eq!(GetWindowLongW(button, GWL_STYLE) & 0xf, BS_PUSHBUTTON);
+                }
+                SendMessageW(dialog.hwnd, WM_COMMAND, WPARAM(IDOK.0 as usize), LPARAM(0));
+                answer(&dialog);
+                assert!(dialog.current());
+                match choice {
+                    Some(true) => {
+                        SendMessageW(ok, BM_CLICK, WPARAM(0), LPARAM(0));
+                    }
+                    Some(false) => {
+                        SendMessageW(no, BM_CLICK, WPARAM(0), LPARAM(0));
+                    }
+                    None => {
+                        SendMessageW(dialog.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+                    }
+                }
+            }
+            answer(&dialog);
+            assert!(!dialog.current());
+            drop(dialog);
+            let enabled = choice.unwrap_or(false);
+            assert_eq!(bridge.auto_policy().0, Some(enabled));
+            assert_eq!(bridge.can_request_lookup(), !enabled);
+            assert_ne!(initial, revision.load(std::sync::atomic::Ordering::Acquire));
+            assert_eq!(
+                UiBridge::with_settings_dir(dir.clone()).auto_policy().0,
+                Some(enabled)
+            );
+            if enabled {
+                let old = bridge.auto_policy().1;
+                bridge.choose_auto(false).unwrap();
+                assert_ne!(old, revision.load(std::sync::atomic::Ordering::Acquire));
+            }
+            assert!(bridge.can_request_lookup());
+            bridge.set_lookup_context(true, false, false);
+            assert!(!bridge.ask_auto_pending());
+            assert!(bridge.can_request_lookup());
+            std::fs::remove_file(dir.join("settings.json")).unwrap();
+            std::fs::remove_dir(dir).unwrap();
+        }
     }
 
     #[test]
