@@ -71,6 +71,23 @@ fn idle_lyrics(
     }
 }
 
+fn retire_unconfirmed(
+    last_applied: &mut Media,
+    playing: bool,
+    screens: &[String],
+    handles_clear: impl Fn(&str) -> bool,
+    mut send: impl FnMut(&str, &str) -> bool,
+) -> bool {
+    *last_applied = Media::anonymous(playing);
+    let legacy = protocol::metadata_only(last_applied);
+    let mut delivered = true;
+    for screen in screens {
+        let packet = if handles_clear(screen) { "" } else { &legacy };
+        delivered &= send(screen, packet);
+    }
+    delivered
+}
+
 struct Worker {
     revision: Arc<AtomicU64>,
     requests: mpsc::Sender<(u64, u64, Media, LookupPermit)>,
@@ -343,16 +360,18 @@ fn core(bridge: &UiBridge) -> Result<(), String> {
                 last_applied.is_some(),
                 sent.is_some(),
             );
-            if let (Some(engine), Some(previous)) = (&engine, last_applied.as_ref()) {
+            if let (Some(engine), Some(previous)) = (&engine, last_applied.as_mut()) {
                 if action == IdleLyrics::Clear {
                     clear_automatic(engine, &screens, Some(previous));
                     last_applied = None;
                 } else if action == IdleLyrics::RetirePacket {
-                    let retired = protocol::metadata_only(previous);
-                    let mut delivered = true;
-                    for display in &screens {
-                        delivered &= engine.send(display, &retired);
-                    }
+                    let delivered = retire_unconfirmed(
+                        previous,
+                        local_playing == Some(true),
+                        &screens,
+                        |display| engine.handles_lyric_clear(display),
+                        |display, packet| engine.send(display, packet),
+                    );
                     if delivered {
                         sent = Some(previous.clone());
                     }
@@ -658,6 +677,85 @@ fn main() {
 mod tests {
     use super::*;
     use crate::media::{Song, Source};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    #[test]
+    fn unconfirmed_video_retires_each_display_without_either_video_title() {
+        let title_a = "Approved video A";
+        let mut approved = Media::anonymous(true);
+        approved.song.title = title_a.into();
+        approved.song.artist = "Performer A".into();
+        approved.duration = 134.0;
+        approved.position = Some(83.0);
+        approved.rate = 1.5;
+        let words =
+            protocol::Lyrics::new(title_a, 134.0, "[00:00.00]First lyric A", "", "测试").unwrap();
+        let first = STANDARD
+            .decode(protocol::build(&approved, Some(&words)))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&first).unwrap()["title"],
+            title_a
+        );
+        let mut next = Media::anonymous(true);
+        next.song.title = "Private video B".into();
+        let local_playing = Some(next.playing);
+        let mut stopped = None;
+        assert_eq!(
+            idle_lyrics(
+                &mut stopped,
+                Instant::now(),
+                local_playing.is_some(),
+                true,
+                false
+            ),
+            IdleLyrics::RetirePacket
+        );
+        let screens = ["new".into(), "old".into()];
+        let mut packets = Vec::new();
+        let delivered = retire_unconfirmed(
+            &mut approved,
+            local_playing == Some(true),
+            &screens,
+            |display| display == "new",
+            |display, packet| {
+                packets.push((display.to_owned(), packet.to_owned()));
+                display != "new"
+            },
+        );
+        assert!(!delivered);
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0], ("new".into(), String::new()));
+        assert_eq!(packets[1].0, "old");
+        let raw = String::from_utf8(STANDARD.decode(&packets[1].1).unwrap()).unwrap();
+        for private_text in [
+            title_a,
+            next.song.title.as_str(),
+            "Performer A",
+            "First lyric A",
+        ] {
+            assert!(!raw.contains(private_text));
+        }
+        let packet: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(packet["title"], "");
+        assert_eq!(packet["artist"], "");
+        assert_eq!(packet["duration"], 0.0);
+        assert_eq!(packet["rate"], 1.0);
+        assert!(packet["position"].is_null());
+        assert!(
+            packet["lyricsText"]
+                .as_str()
+                .unwrap()
+                .starts_with("[ti:metadata]")
+        );
+        assert!(approved.song.title.is_empty() && approved.song.artist.is_empty());
+        assert!(retire_unconfirmed(
+            &mut approved,
+            true,
+            &screens,
+            |_| true,
+            |_, packet| packet.is_empty()
+        ));
+    }
     #[test]
     fn a_brief_session_gap_between_songs_never_clears_the_scene() {
         let start = Instant::now();

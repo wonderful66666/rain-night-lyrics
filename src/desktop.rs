@@ -163,11 +163,10 @@ impl UiBridge {
             },
             Ordering::Release,
         );
-        if ask_auto
+        let pending = ask_auto
             && self.auto_policy().0.is_none()
-            && !self.policy.prompt_failed.load(Ordering::Acquire)
-            && !self.policy.ask_pending.swap(true, Ordering::AcqRel)
-        {
+            && !self.policy.prompt_failed.load(Ordering::Acquire);
+        if self.policy.ask_pending.swap(pending, Ordering::AcqRel) != pending {
             self.post(ASK_AUTO);
         }
     }

@@ -160,8 +160,27 @@ unsafe extern "system" fn shell_event(
 fn desktop_window(hwnd: HWND) -> bool {
     let mut name = [0u16; 64];
     let count = unsafe { GetClassNameW(hwnd, &mut name) } as usize;
-    let name = String::from_utf16_lossy(&name[..count]);
-    name == "Progman" || name == "WorkerW"
+    ["Progman", "WorkerW"]
+        .iter()
+        .any(|class| name[..count].iter().copied().eq(class.encode_utf16()))
+}
+
+fn automatic_dialog(
+    owner: HWND,
+    bridge: &Arc<UiBridge>,
+    clicked_disc: bool,
+    foreground: impl Fn() -> HWND,
+) -> Result<Option<LookupDialog>> {
+    let eligible = || bridge.ask_auto_pending() && (clicked_disc || desktop_window(foreground()));
+    if !eligible() {
+        return Ok(None);
+    }
+    let dialog = LookupDialog::automatic(owner, Arc::clone(bridge))?;
+    if !eligible() {
+        return Ok(None);
+    }
+    dialog.show_automatic(clicked_disc);
+    Ok(Some(dialog))
 }
 
 fn restack(hwnd: HWND) {
@@ -484,7 +503,11 @@ impl Overlay {
             playing,
             has_media: self.view.media.is_some(),
             cover: self.view.cover.as_deref(),
-            status: self.view.status,
+            status: if self.bridge.ask_auto_pending() {
+                "等你选择"
+            } else {
+                self.view.status
+            },
             hover: self.anim.hovered,
             close_hover: self.close_hover,
             content: p.content,
@@ -568,10 +591,11 @@ impl Overlay {
             selected
         }
     }
-    fn input(&mut self, msg: u32, p: LPARAM, t: f64) {
+    fn input(&mut self, msg: u32, p: LPARAM, t: f64) -> bool {
         if !self.anim.interactive(t) {
-            return;
+            return false;
         }
+        let mut prompt_click = false;
         let client = point_lparam(p);
         let point = (self.origin.0 + client.0, self.origin.1 + client.1);
         let part = HIT.get().part(point);
@@ -638,7 +662,10 @@ impl Overlay {
                         if self.anim.expanded && part == Part::Close {
                             self.anim.close(t);
                         } else if part == Part::Disc {
-                            self.anim.set_expanded(!self.anim.expanded, t);
+                            prompt_click = self.bridge.ask_auto_pending();
+                            if !prompt_click {
+                                self.anim.set_expanded(!self.anim.expanded, t);
+                            }
                         }
                     }
                 }
@@ -648,6 +675,7 @@ impl Overlay {
             WM_RBUTTONUP if part != Part::Outside => self.menu(point, t),
             _ => {}
         }
+        prompt_click
     }
 }
 
@@ -791,16 +819,33 @@ pub fn run(bridge: Arc<UiBridge>, stop: HANDLE, show: HANDLE) -> Result<()> {
     let mut meter = Meter::default();
     let mut steady_frames = SteadyFrames::default();
     let mut playback_drawing = 0;
+    let mut waiting_before = false;
+    let mut clicked_disc = false;
     let mut obscured = covered(hwnd, app.origin, disc_dpi(app.anchor.dpi));
     loop {
         let t = start.elapsed().as_secs_f64();
         let was_expanded = app.anim.expanded;
+        let waiting = app.bridge.ask_auto_pending() && app.anim.closing.is_none();
+        if waiting {
+            if !was_expanded {
+                app.anim.reveal(t);
+            }
+            app.anim.collapse_at = None;
+        } else if waiting_before && was_expanded {
+            app.anim.set_expanded(true, t);
+        }
+        dirty |= waiting != waiting_before;
+        waiting_before = waiting;
         app.anim.advance(t);
         dirty |= was_expanded != app.anim.expanded;
         if app.anim.finished(t) {
             break;
         }
-        if app.anim.expanded && app.press.is_none() && unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        if !waiting
+            && app.anim.expanded
+            && app.press.is_none()
+            && unsafe { IsWindowVisible(hwnd) }.as_bool()
+        {
             let down = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0;
             if down
                 && !app.was_down
@@ -867,7 +912,7 @@ pub fn run(bridge: Arc<UiBridge>, stop: HANDLE, show: HANDLE) -> Result<()> {
         } else {
             app.anim.hint_deadline(t)
         };
-        let outside_at = (app.anim.expanded && !app.anim.hovered && !obscured)
+        let outside_at = (!waiting && app.anim.expanded && !app.anim.hovered && !obscured)
             .then(|| animation::next_frame(now, 60.0));
         let finish = app
             .anim
@@ -875,29 +920,39 @@ pub fn run(bridge: Arc<UiBridge>, stop: HANDLE, show: HANDLE) -> Result<()> {
             .map(|at| at + if app.anim.reduced { 0.2 } else { 1.3 });
         let track_at = (app.anchor.docked && !animating && !obscured)
             .then(|| animation::next_frame(now, 30.0));
-        let deadline = [paint_at, track_at, outside_at, app.anim.collapse_at, finish]
-            .into_iter()
-            .flatten()
-            .min_by(f64::total_cmp);
+        let foreground_probe = (waiting && lookup.is_none() && !animating).then_some(now + 1.0);
+        let deadline = [
+            paint_at,
+            track_at,
+            outside_at,
+            app.anim.collapse_at,
+            finish,
+            foreground_probe,
+        ]
+        .into_iter()
+        .flatten()
+        .min_by(f64::total_cmp);
         timer.set(start.elapsed().as_secs_f64(), deadline)?;
         let closing = app.anim.closing.is_some();
         if closing || lookup.as_ref().is_some_and(|d| !d.current()) {
             lookup = None;
         }
+        let click = std::mem::take(&mut clicked_disc);
+        if waiting
+            && click
+            && let Some(dialog) = &lookup
+        {
+            dialog.show_automatic(true);
+        }
         if !closing && lookup.is_none() {
-            if app.bridge.ask_auto_pending() {
-                app.anim.reveal(t);
-                match LookupDialog::automatic(hwnd, Arc::clone(&app.bridge)) {
-                    Ok(dialog) => {
-                        dialog.show();
-                        lookup = Some(dialog);
-                    }
+            if waiting {
+                match automatic_dialog(hwnd, &app.bridge, click, || unsafe {
+                    GetForegroundWindow()
+                }) {
+                    Ok(dialog) => lookup = dialog,
                     Err(_) => app.bridge.auto_prompt_failed(),
                 }
-                dirty = true;
-                continue;
-            }
-            if let Some((id, title)) = app.bridge.lookup_offer() {
+            } else if let Some((id, title)) = app.bridge.lookup_offer() {
                 match LookupDialog::open(hwnd, id, &title, Arc::clone(&app.bridge)) {
                     Ok(dialog) if dialog.current() => {
                         dialog.show();
@@ -983,7 +1038,8 @@ pub fn run(bridge: Arc<UiBridge>, stop: HANDLE, show: HANDLE) -> Result<()> {
                             app.close_hover,
                             app.press.as_ref().filter(|p| p.dragged).map(|p| p.offset),
                         );
-                        app.input(m.wParam.0 as u32, m.lParam, start.elapsed().as_secs_f64());
+                        clicked_disc |=
+                            app.input(m.wParam.0 as u32, m.lParam, start.elapsed().as_secs_f64());
                         dirty |= !matches!(event, WM_MOUSEMOVE | LEAVE)
                             || before
                                 != (
@@ -1034,6 +1090,190 @@ mod tests {
     };
     use windows::Win32::System::Threading::{CreateEventW, SetEvent};
     use windows::core::Owned;
+
+    fn fresh_prompt_bridge() -> Arc<UiBridge> {
+        Arc::new(UiBridge::with_settings_dir(std::env::temp_dir().join(
+            format!(
+                "rain-night-prompt-focus-{}-{:?}",
+                std::process::id(),
+                thread::current().id()
+            ),
+        )))
+    }
+
+    #[test]
+    fn foreign_window_defers_the_automatic_dialog_and_changing_source_withdraws_it() {
+        let bridge = fresh_prompt_bridge();
+        let window = unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("Private fullscreen fixture"),
+                WS_POPUP,
+                0,
+                0,
+                GetSystemMetrics(SM_CXSCREEN),
+                GetSystemMetrics(SM_CYSCREEN),
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        bridge.set_lookup_context(false, true, true);
+        assert!(bridge.ask_auto_pending());
+        assert!(
+            automatic_dialog(HWND::default(), &bridge, false, || window)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            automatic_dialog(HWND::default(), &bridge, false, HWND::default)
+                .unwrap()
+                .is_none()
+        );
+        if let Ok(shell) = unsafe { FindWindowW(w!("Progman"), None) } {
+            let calls = Cell::new(0);
+            let stale = automatic_dialog(HWND::default(), &bridge, false, || {
+                let index = calls.get();
+                calls.set(index + 1);
+                if index == 0 { shell } else { window }
+            })
+            .unwrap();
+            assert_eq!(calls.get(), 2);
+            assert!(stale.is_none());
+        }
+        assert!(bridge.ask_auto_pending());
+        bridge.set_lookup_context(true, false, false);
+        assert!(!bridge.ask_auto_pending());
+        assert!(
+            automatic_dialog(HWND::default(), &bridge, true, || window)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(bridge.auto_policy().0, None);
+        unsafe { DestroyWindow(window) }.unwrap();
+    }
+
+    #[test]
+    #[ignore = "explicit acceptance with a real foreground fullscreen application"]
+    fn live_fullscreen_application_keeps_focus_while_auto_choice_is_pending() {
+        if std::env::var_os("RAIN_NIGHT_VERIFY_FOREGROUND").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        {
+            return;
+        }
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+        };
+        let bridge = fresh_prompt_bridge();
+        bridge.set_lookup_context(false, true, true);
+        let end = Instant::now() + Duration::from_secs(55);
+        let mut previous = HWND::default();
+        let mut consecutive = 0;
+        while Instant::now() < end {
+            let hwnd = unsafe { GetForegroundWindow() };
+            let mut rect = RECT::default();
+            let mut monitor = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let fullscreen = !hwnd.is_invalid()
+                && !desktop_window(hwnd)
+                && unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok()
+                && unsafe {
+                    GetMonitorInfoW(
+                        MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                        &mut monitor,
+                    )
+                }
+                .as_bool()
+                && rect.left <= monitor.rcMonitor.left
+                && rect.top <= monitor.rcMonitor.top
+                && rect.right >= monitor.rcMonitor.right
+                && rect.bottom >= monitor.rcMonitor.bottom;
+            if fullscreen {
+                assert!(
+                    automatic_dialog(HWND::default(), &bridge, false, || hwnd)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            consecutive =
+                if fullscreen && previous == hwnd && unsafe { GetForegroundWindow() } == hwnd {
+                    consecutive + 1
+                } else {
+                    0
+                };
+            if consecutive >= 10 {
+                assert!(bridge.ask_auto_pending());
+                eprintln!(
+                    "fullscreen_foreground_retained=true automatic_dialog_opened=false choice_pending=true"
+                );
+                return;
+            }
+            previous = hwnd;
+            thread::sleep(Duration::from_millis(200));
+        }
+        panic!("no stable foreground fullscreen application was observed");
+    }
+
+    #[test]
+    #[ignore = "explicit acceptance on an isolated Win32 desktop"]
+    fn private_fullscreen_waits_for_a_disc_click() {
+        if std::env::var_os("RAIN_NIGHT_VERIFY_PRIVATE_FOCUS").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        {
+            return;
+        }
+        use windows::Win32::System::Threading::{GetStartupInfoW, STARTUPINFOW};
+        let mut startup = STARTUPINFOW::default();
+        unsafe { GetStartupInfoW(&mut startup) };
+        assert!(!startup.lpDesktop.is_null());
+        assert!(
+            unsafe { startup.lpDesktop.to_string() }
+                .unwrap()
+                .starts_with("WinSta0\\RainNightLyrics-QA-")
+        );
+        let bridge = fresh_prompt_bridge();
+        let fullscreen = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Fullscreen fixture"),
+                WS_POPUP | WS_VISIBLE,
+                0,
+                0,
+                GetSystemMetrics(SM_CXSCREEN),
+                GetSystemMetrics(SM_CYSCREEN),
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        unsafe { SetActiveWindow(fullscreen) }.unwrap();
+        bridge.set_lookup_context(false, true, true);
+        let active = || unsafe { GetActiveWindow() };
+        assert_eq!(active(), fullscreen);
+        assert!(
+            automatic_dialog(HWND::default(), &bridge, false, active)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(active(), fullscreen);
+        assert!(bridge.ask_auto_pending());
+        let dialog = automatic_dialog(HWND::default(), &bridge, true, active)
+            .unwrap()
+            .expect("disc click should open a dialog");
+        assert!(dialog.current());
+        assert_ne!(active(), fullscreen);
+        drop(dialog);
+        unsafe { DestroyWindow(fullscreen) }.unwrap();
+        eprintln!("private_native_fullscreen_deferred=true disc_click_opens_dialog=true");
+    }
 
     #[test]
     fn steady_frames_coalesce_timer_and_window_messages_in_the_same_slot() {

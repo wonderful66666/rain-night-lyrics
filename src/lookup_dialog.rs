@@ -87,7 +87,7 @@ fn template(automatic: bool) -> Vec<u32> {
             AUTO_BODY as u16,
             [12, 10, 284, 66],
             0,
-            "你用音乐软件听歌时，取词器可以自动把歌名和歌手发给网易云曲库或 LRCLIB，查到后显示在壁纸上。浏览器里的视频标题不会自动发送。\r\n\r\n这个选择随时可以在圆圈的右键菜单里修改。",
+            "你用音乐软件听歌时，取词器可以自动把歌名发给网易云曲库或 LRCLIB，查到后显示在壁纸上。浏览器里的视频标题不会自动发送。\r\n\r\n这个选择随时可以在小唱片的右键菜单里修改。",
         ),
         (
             0x80,
@@ -215,13 +215,32 @@ impl LookupDialog {
     }
 
     pub fn show(&self) {
+        if self.id.is_none() {
+            return;
+        }
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNORMAL);
             let _ = SetForegroundWindow(self.hwnd);
-            if let Ok(control) =
-                GetDlgItem(self.hwnd, if self.id.is_some() { TITLE } else { AUTO_BODY })
-            {
+            if let Ok(control) = GetDlgItem(self.hwnd, TITLE) {
                 let _ = SetFocus(control);
+            }
+        }
+    }
+
+    pub fn show_automatic(&self, clicked_disc: bool) {
+        if self.id.is_some() {
+            return;
+        }
+        unsafe {
+            if clicked_disc {
+                let _ = ShowWindow(self.hwnd, SW_SHOWNORMAL);
+                if GetForegroundWindow() == self.hwnd
+                    && let Ok(body) = GetDlgItem(self.hwnd, AUTO_BODY)
+                {
+                    let _ = SetFocus(body);
+                }
+            } else {
+                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
             }
         }
     }
@@ -339,6 +358,10 @@ mod tests {
             bridge.set_lookup_context(false, true, true);
             assert!(!bridge.can_request_lookup());
             let dialog = LookupDialog::automatic(HWND::default(), Arc::clone(&bridge)).unwrap();
+            let body = field(dialog.hwnd, AUTO_BODY).unwrap();
+            assert!(body.contains("把歌名发给网易云曲库或 LRCLIB"));
+            assert!(body.contains("小唱片的右键菜单"));
+            assert!(!body.contains("歌手") && !body.contains("圆圈"));
             assert_eq!(bridge.auto_policy().0, None);
             let revision = bridge.auto_revision();
             let initial = bridge.auto_policy().1;
