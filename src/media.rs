@@ -1,3 +1,5 @@
+use crate::desktop::Cover;
+use std::cell::RefCell;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::Foundation::{AsyncStatus, IAsyncOperation};
@@ -5,6 +7,10 @@ use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSessionManager as SessionManager,
     GlobalSystemMediaTransportControlsSessionPlaybackStatus as Playback,
 };
+use windows::Storage::Streams::IRandomAccessStreamReference;
+use windows::Win32::Graphics::Imaging::*;
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IStream};
+use windows::Win32::System::WinRT::CreateStreamOverRandomAccessStream;
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
 use windows::core::{HRESULT, Result, RuntimeType};
 
@@ -141,10 +147,73 @@ impl Drop for Apartment {
     }
 }
 
-pub struct Sessions(SessionManager);
+pub struct Sessions(
+    SessionManager,
+    RefCell<Option<IRandomAccessStreamReference>>,
+);
 impl Sessions {
     pub fn open() -> Result<Self> {
-        Ok(Self(finish(SessionManager::RequestAsync()?)?))
+        Ok(Self(
+            finish(SessionManager::RequestAsync()?)?,
+            RefCell::default(),
+        ))
+    }
+
+    pub fn cover(&self, size: u32) -> Option<Cover> {
+        let source = self.1.borrow().clone()?;
+        let stream = finish(source.OpenReadAsync().ok()?).ok()?;
+        if stream.Size().ok()? > 32 * 1024 * 1024 {
+            return None;
+        }
+        unsafe {
+            let input: IStream = CreateStreamOverRandomAccessStream(&stream).ok()?;
+            let factory: IWICImagingFactory =
+                CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+            let decoder = factory
+                .CreateDecoderFromStream(&input, std::ptr::null(), WICDecodeMetadataCacheOnDemand)
+                .ok()?;
+            let frame = decoder.GetFrame(0).ok()?;
+            let (mut width, mut height) = (0, 0);
+            frame.GetSize(&mut width, &mut height).ok()?;
+            let side = width.min(height);
+            if side == 0
+                || width.max(height) > 16384
+                || u64::from(width) * u64::from(height) > 64_000_000
+            {
+                return None;
+            }
+            let crop = factory.CreateBitmapClipper().ok()?;
+            crop.Initialize(
+                &frame,
+                &WICRect {
+                    X: ((width - side) / 2) as i32,
+                    Y: ((height - side) / 2) as i32,
+                    Width: side as i32,
+                    Height: side as i32,
+                },
+            )
+            .ok()?;
+            let scaler = factory.CreateBitmapScaler().ok()?;
+            scaler
+                .Initialize(&crop, size, size, WICBitmapInterpolationModeFant)
+                .ok()?;
+            let converter = factory.CreateFormatConverter().ok()?;
+            converter
+                .Initialize(
+                    &scaler,
+                    &GUID_WICPixelFormat32bppPBGRA,
+                    WICBitmapDitherTypeNone,
+                    None,
+                    0.0,
+                    WICBitmapPaletteTypeCustom,
+                )
+                .ok()?;
+            let mut pixels = vec![0; (size * size * 4) as usize];
+            converter
+                .CopyPixels(std::ptr::null(), size * 4, &mut pixels)
+                .ok()?;
+            Some(Cover { size, pixels })
+        }
     }
 
     pub fn current(&self) -> Result<Option<Media>> {
@@ -159,6 +228,7 @@ impl Sessions {
             return Ok(None);
         }
         let metadata = finish(session.TryGetMediaPropertiesAsync()?)?;
+        self.1.replace(metadata.Thumbnail().ok());
         let title = text(&metadata.Title()?.to_string_lossy());
         if title.is_empty() {
             return Ok(None);

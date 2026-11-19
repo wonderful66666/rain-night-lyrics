@@ -1,14 +1,21 @@
+#![windows_subsystem = "windows"]
+mod animation;
 mod audio;
+mod desktop;
 mod lookup;
 mod media;
+mod placement;
 mod protocol;
+mod render;
+mod ui;
 mod wallpaper;
 
 use audio::OutputWatch;
+use desktop::{UiBridge, UiSnapshot};
 use lookup::{Catalog, Outcome};
 use media::{Apartment, Media, Sessions, Song};
+use placement::CapsuleData;
 use std::collections::HashMap;
-use std::io::{self, IsTerminal};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -16,7 +23,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
-use wallpaper::{Engine, SingleInstance, StopSignal, WORKSHOP_ID};
+use wallpaper::{Engine, ReloadReason, SingleInstance, StopSignal, WORKSHOP_ID};
 
 struct CacheEntry {
     until: Instant,
@@ -87,14 +94,6 @@ impl Worker {
     }
 }
 
-fn message(last: &mut String, next: &str) {
-    if last != next {
-        println!("{next}");
-        last.clear();
-        last.push_str(next);
-    }
-}
-
 fn check() -> Result<(), String> {
     let engine = Engine::find();
     let screens = engine.as_ref().map(Engine::displays).unwrap_or_default();
@@ -103,6 +102,9 @@ fn check() -> Result<(), String> {
         engine.is_some(),
         screens.len()
     );
+    if let Some((hz, fps)) = ui::frame_stats() {
+        println!("桌面圆圈　屏幕刷新率 {hz:.1} Hz　最近绘制 {fps:.1} 帧/秒");
+    }
     match OutputWatch::open().and_then(|w| w.status()) {
         Ok((notifications, output)) => println!(
             "音柱重连　设备通知 {}　默认输出 {}",
@@ -119,42 +121,32 @@ fn check() -> Result<(), String> {
         ),
         Err(_) => println!("音柱重连　暂时无法读取默认输出设备。"),
     }
-    match Sessions::open().and_then(|s| s.current()) {
-        Ok(Some(m)) => println!(
-            "Windows 媒体来源 {}　正在播放 {}　有进度 {}",
-            m.song.source.label(),
-            m.playing,
-            m.position.is_some()
-        ),
+    let sessions = Sessions::open().map_err(|_| "无法读取 Windows 媒体会话。")?;
+    match sessions.current() {
+        Ok(Some(m)) => {
+            println!(
+                "Windows 媒体来源 {}　正在播放 {}　有进度 {}",
+                m.song.source.label(),
+                m.playing,
+                m.position.is_some()
+            );
+            println!(
+                "媒体封面 {}",
+                if sessions.cover(34).is_some() {
+                    "可用"
+                } else {
+                    "使用内置唱片"
+                }
+            );
+        }
         Ok(None) => println!("Windows 当前没有播放或暂停的媒体会话。"),
         Err(_) => return Err("无法读取 Windows 媒体会话。".into()),
     }
     Ok(())
 }
 
-fn run() -> Result<(), String> {
-    let _instance = match SingleInstance::acquire().map_err(|_| "无法检查取词器状态。")? {
-        Some(instance) => instance,
-        None => {
-            println!("已有取词器在运行。");
-            check()?;
-            if io::stdin().is_terminal() {
-                println!("按回车关闭本窗口。输入 q 并回车可停止正在运行的 Rust 取词器。");
-                let mut answer = String::new();
-                if io::stdin().read_line(&mut answer).is_ok()
-                    && answer.trim().eq_ignore_ascii_case("q")
-                {
-                    StopSignal::send();
-                }
-            }
-            return Ok(());
-        }
-    };
-    let stop = StopSignal::create().map_err(|_| "无法创建退出信号。")?;
-    println!(
-        "雨夜轻息 · 独立取词器 v{}　关闭窗口或按 Ctrl+C 退出。",
-        env!("CARGO_PKG_VERSION")
-    );
+fn core(bridge: &UiBridge) -> Result<(), String> {
+    let _apartment = Apartment::open().map_err(|_| "无法连接 Windows 媒体服务。")?;
     let mut sessions = None;
     let mut engine = None;
     let mut screens = Vec::new();
@@ -164,15 +156,27 @@ fn run() -> Result<(), String> {
     let mut cache = HashMap::<Song, CacheEntry>::new();
     let mut song = None;
     let mut sent: Option<Media> = None;
-    let mut status = String::new();
-    while !stop.requested() {
+    let mut art = None;
+    let mut art_key = None;
+    let mut retry_art = Instant::now();
+    let mut last_track: Option<(Song, Instant)> = None;
+    let mut notice_until = None;
+    let mut scene = CapsuleData::default();
+    let mut delay = 0;
+    while !bridge.finished.load(Ordering::Acquire) {
         let now = Instant::now();
         if now >= poll_engine {
             let active = Engine::find();
-            let locations = active.as_ref().map(Engine::displays).unwrap_or_default();
+            let (locations, geometry, offset) =
+                active.as_ref().map(Engine::scene).unwrap_or_default();
+            scene = geometry;
+            delay = offset;
             if engine != active || locations != screens {
                 sent = None;
                 audio = None;
+                if locations.is_empty() && !screens.is_empty() {
+                    worker.cancel();
+                }
             }
             if !locations.is_empty() && audio.is_none() {
                 audio = OutputWatch::open().ok();
@@ -181,29 +185,27 @@ fn run() -> Result<(), String> {
             screens = locations;
             poll_engine = now + Duration::from_secs(2);
         }
-        if screens.is_empty() {
-            if song.take().is_some() {
-                worker.cancel();
-            }
-            sessions = None;
-            message(
-                &mut status,
-                if engine.is_none() {
-                    "等待 Wallpaper Engine 启动。"
-                } else {
-                    "等待桌面选用工坊订阅的《雨夜轻息》。"
-                },
-            );
-            thread::sleep(Duration::from_millis(500));
-            continue;
-        }
-        let engine = engine.as_ref().unwrap();
-        if let Some(watch) = &mut audio {
+        let waiting = if engine.is_none() {
+            Some("等待 Wallpaper Engine")
+        } else if screens.is_empty() {
+            Some("未使用雨夜轻息")
+        } else {
+            None
+        };
+        let idle = |status| UiSnapshot {
+            status: waiting.unwrap_or(status),
+            placement: CapsuleData {
+                title: "正在播放".into(),
+                ..scene.clone()
+            },
+            ..Default::default()
+        };
+        if let (Some(watch), Some(engine)) = (&mut audio, &engine) {
             match watch.ready(now) {
                 Ok(true) => {
-                    let (count, retry) = engine.reload_audio(&screens);
+                    let (count, retry) = engine.reload(&screens, ReloadReason::AudioOutput);
                     if count > 0 {
-                        println!("音频输出已恢复播放，已请求重新载入 {count} 个《雨夜轻息》场景。");
+                        desktop::log("音频输出切换后有声，已请求重新载入场景");
                         sent = None;
                     }
                     if retry {
@@ -218,29 +220,33 @@ fn run() -> Result<(), String> {
             sessions = Sessions::open().ok();
         }
         let Some(manager) = sessions.as_ref() else {
-            message(&mut status, "Windows 媒体服务暂时不可用，正在重试。");
-            thread::sleep(Duration::from_secs(2));
+            bridge.publish(idle("等待播放"));
+            thread::park_timeout(Duration::from_secs(2));
             continue;
         };
         let current = match manager.current() {
             Ok(m) => m,
             Err(_) => {
                 sessions = None;
-                message(&mut status, "正在重新连接 Windows 媒体会话。");
-                thread::sleep(Duration::from_secs(1));
+                bridge.publish(idle("等待播放"));
+                thread::park_timeout(Duration::from_secs(1));
                 continue;
             }
         };
         let Some(m) = current else {
             if song.take().is_some() {
                 worker.cancel();
-                for display in &screens {
-                    engine.send(display, "");
+                if let Some(engine) = &engine {
+                    for display in &screens {
+                        engine.send(display, "");
+                    }
                 }
                 sent = None;
             }
-            message(&mut status, "已连接工坊版，等待 Windows 播放媒体。");
-            thread::sleep(Duration::from_millis(500));
+            art = None;
+            art_key = None;
+            bridge.publish(idle("等待播放"));
+            thread::park_timeout(Duration::from_millis(500));
             continue;
         };
         if song.as_ref().is_none_or(|(previous, duration)| {
@@ -249,9 +255,24 @@ fn run() -> Result<(), String> {
             worker.cancel();
             song = Some((m.song.clone(), m.duration));
             sent = None;
-            status.clear();
+        }
+        if let Some((old, when)) = &last_track
+            && old != &m.song
+        {
+            notice_until = (now.duration_since(*when) < Duration::from_secs(5))
+                .then_some(now + Duration::from_millis(3450));
+        }
+        last_track = Some((m.song.clone(), now));
+        let key = (m.song.clone(), bridge.desired_size());
+        if art_key.as_ref() != Some(&key) || (art.is_none() && now >= retry_art) {
+            art = manager.cover(key.1).map(Arc::new);
+            art_key = Some(key);
+            retry_art = now + Duration::from_secs(15);
         }
         if let Some(result) = worker.ready() {
+            if let Outcome::Found(words) = &result {
+                desktop::log(words.provider)
+            }
             let seconds = match &result {
                 Outcome::Found(_) => 21600,
                 Outcome::Missing => 600,
@@ -285,7 +306,7 @@ fn run() -> Result<(), String> {
             sent = None;
         }
         let entry = cache.get(&m.song);
-        if entry.is_none() && m.playing {
+        if entry.is_none() && m.playing && waiting.is_none() {
             worker.request(&m);
         }
         let words = entry.and_then(|e| {
@@ -296,7 +317,10 @@ fn run() -> Result<(), String> {
             }
         });
         let mut delivered = true;
-        if sent.as_ref().is_none_or(|old| m.needs_sync(old)) {
+        if let Some(engine) = &engine
+            && !screens.is_empty()
+            && sent.as_ref().is_none_or(|old| m.needs_sync(old))
+        {
             let packet = protocol::build(&m, words);
             for display in &screens {
                 if !engine.send(display, &packet) {
@@ -310,34 +334,120 @@ fn run() -> Result<(), String> {
             }
         }
         let state = if !delivered {
-            "壁纸切换中，正在重连".to_owned()
+            "正在重连壁纸"
+        } else if !m.playing {
+            "已暂停"
         } else {
             match entry.map(|e| &e.result) {
-                Some(Outcome::Found(w)) => format!("已把{}的同步歌词送到壁纸", w.provider),
-                Some(Outcome::Missing) => "曲库未找到匹配的同步歌词，胶囊显示歌名".into(),
-                Some(Outcome::Unavailable) => "查词服务暂时未返回有效结果，稍后重试".into(),
-                None if !m.playing => "播放后开始查词".into(),
-                None => "正在查找同步歌词".into(),
+                Some(Outcome::Found(_)) => "歌词已同步",
+                Some(Outcome::Missing) => "没找到歌词",
+                Some(Outcome::Unavailable) => "查词服务忙",
+                None => "正在找歌词",
             }
         };
-        let playback = if m.playing { "播放中" } else { "已暂停" };
-        let clock = if m.position.is_none() {
-            " · 播放器未提供进度"
-        } else {
-            ""
+        let (title, subtitle) = words
+            .and_then(|w| w.displayed(&m, delay))
+            .unwrap_or((&m.song.title, &m.song.artist));
+        let placement = CapsuleData {
+            title: title.to_owned(),
+            subtitle: subtitle.to_owned(),
+            notice: notice_until
+                .filter(|until| *until > now)
+                .map(|_| ("正在播放".into(), m.song.title.clone())),
+            ..scene.clone()
         };
-        message(
-            &mut status,
-            &format!("{} · {playback} · {state}{clock}", m.song.source.label()),
-        );
-        thread::sleep(Duration::from_millis(480));
+        bridge.publish(UiSnapshot {
+            media: Some(m),
+            cover: art.clone(),
+            status: waiting.unwrap_or(state),
+            placement,
+        });
+        thread::park_timeout(Duration::from_millis(480));
     }
     worker.cancel();
+    if let Some(engine) = Engine::find() {
+        let displays = engine.displays();
+        if let Some(media) = sent.as_ref() {
+            let mut wait = false;
+            let packet = protocol::metadata_only(media);
+            for display in &displays {
+                if engine.in_playlist(display) {
+                    wait |= engine.send(display, &packet);
+                }
+            }
+            if wait {
+                thread::sleep(Duration::from_millis(420));
+            }
+        }
+        let mut cleared_displays = Vec::new();
+        for display in displays {
+            let mut cleared = engine.send(&display, "");
+            if !cleared && engine.displays().contains(&display) {
+                thread::sleep(Duration::from_millis(100));
+                cleared = engine.send(&display, "");
+            }
+            if cleared {
+                cleared_displays.push(display)
+            } else {
+                desktop::log("清空歌词时场景不可用");
+            }
+        }
+        let (count, retry) = engine.reload(&cleared_displays, ReloadReason::LyricsCleared);
+        if count > 0 {
+            desktop::log("已清空自动歌词并请求刷新当前场景");
+        }
+        if retry {
+            desktop::log("场景刷新命令未完成");
+        }
+    }
     Ok(())
+}
+
+fn run() -> Result<(), String> {
+    let show = StopSignal::show_event().map_err(|_| "无法创建桌面提示事件。")?;
+    let Some(_single) = SingleInstance::acquire().map_err(|_| "无法检查取词器状态。")?
+    else {
+        StopSignal::show();
+        return Ok(());
+    };
+    let stop = StopSignal::create().map_err(|_| "无法创建退出事件。")?;
+    let bridge = Arc::new(UiBridge::default());
+    if let Some(engine) = Engine::find() {
+        let (_, placement, _) = engine.scene();
+        bridge.publish(UiSnapshot {
+            status: if placement.display.is_some() {
+                "等待播放"
+            } else {
+                "未使用雨夜轻息"
+            },
+            placement,
+            ..UiSnapshot::default()
+        });
+    }
+    let worker = Arc::clone(&bridge);
+    let core_thread = thread::spawn(move || core(&worker));
+    let result = ui::run(Arc::clone(&bridge), stop.handle(), show.handle());
+    bridge.finished.store(true, Ordering::Release);
+    core_thread.thread().unpark();
+    core_thread.join().map_err(|_| "媒体线程意外退出。")??;
+    result.map_err(|_| "无法显示桌面圆圈。".into())
 }
 
 fn main() {
     let option = std::env::args().nth(1);
+    if option.is_some() {
+        unsafe {
+            use windows::Win32::System::Console::*;
+            let saved = [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+                .map(|k| (k, GetStdHandle(k).ok().filter(|h| !h.is_invalid())));
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+            for (k, handle) in saved {
+                if let Some(handle) = handle {
+                    let _ = SetStdHandle(k, handle);
+                }
+            }
+        }
+    }
     if option.as_deref() == Some("--stop") {
         println!(
             "{}",
@@ -353,9 +463,13 @@ fn main() {
         println!("RainNightLyrics.exe [--check | --stop]");
         return;
     }
-    let result = Apartment::open()
-        .map_err(|_| "无法连接 Windows 运行时。".into())
-        .and_then(|_apartment| if option.is_some() { check() } else { run() });
+    let result = if option.is_none() {
+        run()
+    } else {
+        Apartment::open()
+            .map_err(|_| "无法连接 Windows 运行时。".into())
+            .and_then(|_apartment| check())
+    };
     if let Err(msg) = result {
         eprintln!("{msg}");
         std::process::exit(1);

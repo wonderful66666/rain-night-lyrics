@@ -33,17 +33,31 @@ impl StopSignal {
             )))
         }
     }
-    pub fn requested(&self) -> bool {
-        unsafe { WaitForSingleObject(*self.0, 0) == WAIT_OBJECT_0 }
+    pub fn handle(&self) -> HANDLE {
+        *self.0
+    }
+    pub fn show_event() -> windows::core::Result<Self> {
+        unsafe {
+            Ok(Self(Owned::new(
+                windows::Win32::System::Threading::CreateEventW(
+                    None,
+                    false,
+                    false,
+                    w!("Local\\RainNightLyrics-Subscriber-Show"),
+                )?,
+            )))
+        }
     }
     pub fn send() -> bool {
+        Self::signal(w!("Local\\RainNightLyrics-Subscriber-Stop"))
+    }
+    pub fn show() -> bool {
+        Self::signal(w!("Local\\RainNightLyrics-Subscriber-Show"))
+    }
+    fn signal(name: windows::core::PCWSTR) -> bool {
         use windows::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
         unsafe {
-            let Ok(event) = OpenEventW(
-                EVENT_MODIFY_STATE,
-                false,
-                w!("Local\\RainNightLyrics-Subscriber-Stop"),
-            ) else {
+            let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, name) else {
                 return false;
             };
             let event = Owned::new(event);
@@ -159,13 +173,28 @@ fn selected(config: &Value, user: &str) -> Vec<String> {
         .collect()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReloadReason {
+    AudioOutput,
+    LyricsCleared,
+}
+
+fn in_playlist(entry: &Value) -> bool {
+    entry
+        .get("playlist")
+        .is_some_and(|v| !v.is_null() && v.as_str() != Some("") && v.as_bool() != Some(false))
+}
+
 fn reload_target<'a>(
     config: &'a Value,
     user: &str,
     display: &str,
+    reason: ReloadReason,
 ) -> Option<(&'a str, Option<&'a str>)> {
     let settings = user_settings(config, user)?;
-    if let Some(device) = settings.pointer("/user/audioinputdevice") {
+    if reason == ReloadReason::AudioOutput
+        && let Some(device) = settings.pointer("/user/audioinputdevice")
+    {
         let device = device.as_str()?;
         if !device.is_empty() && !device.eq_ignore_ascii_case("default") {
             return None;
@@ -174,10 +203,7 @@ fn reload_target<'a>(
     let entry = settings
         .pointer("/wallpaperconfig/selectedwallpapers")?
         .get(display)?;
-    if entry
-        .get("playlist")
-        .is_some_and(|value| !value.is_null() && value.as_str() != Some(""))
-    {
+    if in_playlist(entry) {
         return None;
     }
     let file = entry.get("file")?.as_str()?;
@@ -247,8 +273,76 @@ impl Engine {
             .map(|c| selected(&c, &std::env::var("USERNAME").unwrap_or_default()))
             .unwrap_or_default()
     }
+    pub fn scene(&self) -> (Vec<String>, crate::placement::CapsuleData, i64) {
+        let mut data = crate::placement::CapsuleData::default();
+        let Some(cfg) = self.config() else {
+            return (Vec::new(), data, 0);
+        };
+        let name = std::env::var("USERNAME").unwrap_or_default();
+        let screens = selected(&cfg, &name);
+        let Some(display) = screens.first() else {
+            return (screens, data, 0);
+        };
+        data.display = Some(display.clone());
+        data.fonts = self.exe.parent().map(|dir| dir.join("assets/fonts"));
+        if let Some(settings) = user_settings(&cfg, &name) {
+            data.paths = crate::placement::display_paths(settings, display);
+        }
+        let Some(user) = cfg
+            .as_object()
+            .and_then(|users| {
+                users
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(&name))
+            })
+            .map(|(_, v)| v)
+        else {
+            return (screens, data, 0);
+        };
+        let selected_file = user
+            .pointer("/general/wallpaperconfig/selectedwallpapers")
+            .and_then(|m| m.get(display))
+            .and_then(|e| e.get("file"))
+            .and_then(Value::as_str);
+        let Some(file) = selected_file else {
+            return (screens, data, 0);
+        };
+        let mut project = PathBuf::from(file);
+        project.set_file_name("project.json");
+        let props = user
+            .get("wproperties")
+            .and_then(Value::as_object)
+            .and_then(|map| {
+                map.iter().find(|(path, _)| {
+                    Path::new(path) == Path::new(file) || Path::new(path) == project
+                })
+            })
+            .and_then(|(_, p)| p.get(display));
+        let number = |key: &str| {
+            props
+                .and_then(|p| p.get(key))
+                .map(|v| v.get("value").unwrap_or(v))
+                .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
+                .unwrap_or(0)
+        };
+        data.font = number("capsulefont").clamp(0, 2) as u8;
+        (
+            screens,
+            data,
+            number("capsulelyricdelay").clamp(-30000, 30000),
+        )
+    }
 
-    pub fn reload_audio(&self, displays: &[String]) -> (usize, bool) {
+    pub fn in_playlist(&self, display: &str) -> bool {
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        self.config().is_some_and(|cfg| {
+            user_settings(&cfg, &user)
+                .and_then(|s| s.pointer("/wallpaperconfig/selectedwallpapers"))
+                .and_then(|v| v.get(display))
+                .is_some_and(in_playlist)
+        })
+    }
+    pub fn reload(&self, displays: &[String], reason: ReloadReason) -> (usize, bool) {
         let user = std::env::var("USERNAME").unwrap_or_default();
         let mut requested = 0;
         let mut retry = false;
@@ -260,7 +354,7 @@ impl Engine {
                 retry = true;
                 continue;
             };
-            let Some((file, preset)) = reload_target(&config, &user, display) else {
+            let Some((file, preset)) = reload_target(&config, &user, display, reason) else {
                 continue;
             };
             if !Path::new(file).is_file() {
@@ -336,6 +430,13 @@ mod tests {
     use super::*;
     use serde_json::json;
     #[test]
+    fn first_matched_screen_follows_config_order() {
+        let file = format!("Q:/Library/steamapps/workshop/content/431960/{WORKSHOP_ID}/scene.pkg");
+        let cfg = json!({"User":{"general":{"wallpaperconfig":{"selectedwallpapers":{"Monitor2":{"file":file},"Monitor0":{"file":file}}}}}});
+        let restored: Value = serde_json::from_slice(&serde_json::to_vec(&cfg).unwrap()).unwrap();
+        assert_eq!(selected(&restored, "user"), ["Monitor2", "Monitor0"]);
+    }
+    #[test]
     fn targets_only_this_subscription_across_libraries_and_monitors() {
         let file =
             format!("Q:/Steam Library/steamapps/workshop/content/431960/{WORKSHOP_ID}/scene.pkg");
@@ -357,15 +458,24 @@ mod tests {
             "Monitor0":{"file":file,"preset":"Evening"}, "Monitor1":{"file":file.replace(WORKSHOP_ID, "10")}
         }}}}});
         assert_eq!(
-            reload_target(&config, "listener", "Monitor0"),
+            reload_target(&config, "listener", "Monitor0", ReloadReason::AudioOutput),
             Some((file.as_str(), Some("Evening")))
         );
-        assert!(reload_target(&config, "listener", "Monitor1").is_none());
+        assert!(
+            reload_target(&config, "listener", "Monitor1", ReloadReason::LyricsCleared).is_none()
+        );
         config["Listener"]["general"]["user"] = json!({"audioinputdevice":"microphone"});
-        assert!(reload_target(&config, "listener", "Monitor0").is_none());
+        assert!(
+            reload_target(&config, "listener", "Monitor0", ReloadReason::AudioOutput).is_none()
+        );
+        assert!(
+            reload_target(&config, "listener", "Monitor0", ReloadReason::LyricsCleared).is_some()
+        );
         config["Listener"]["general"]["user"]["audioinputdevice"] = json!("Default");
         config["Listener"]["general"]["wallpaperconfig"]["selectedwallpapers"]["Monitor0"]["playlist"] =
             json!("evening rotation");
-        assert!(reload_target(&config, "listener", "Monitor0").is_none());
+        assert!(
+            reload_target(&config, "listener", "Monitor0", ReloadReason::LyricsCleared).is_none()
+        );
     }
 }

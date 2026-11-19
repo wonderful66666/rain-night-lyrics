@@ -98,6 +98,32 @@ impl Lyrics {
         }
         (p * 1000.0) as i64
     }
+    pub fn displayed(&self, m: &Media, delay: i64) -> Option<(&str, &str)> {
+        m.position?;
+        let at = self.at(m) + delay;
+        let end = self.main.partition_point(|cue| cue.ms <= at);
+        let cue = self.main.get(end.checked_sub(1)?)?;
+        if cue.text.is_empty()
+            || cue.text == "//"
+            || (at - cue.ms > 9000
+                && self
+                    .main
+                    .get(end)
+                    .is_none_or(|next| next.ms - cue.ms > 12000))
+        {
+            return None;
+        }
+        let i = self.translation.partition_point(|row| row.ms <= cue.ms);
+        let translated = self
+            .translation
+            .get(i)
+            .into_iter()
+            .chain(i.checked_sub(1).and_then(|j| self.translation.get(j)))
+            .min_by_key(|row| row.ms.abs_diff(cue.ms))
+            .filter(|r| r.ms.abs_diff(cue.ms) <= 500 && r.text != "//" && r.text != cue.text)
+            .map_or("", |r| r.text.as_str());
+        Some((&cue.text, translated))
+    }
 }
 
 fn lrc(rows: &[Cue], header: &str) -> String {
@@ -150,6 +176,17 @@ fn encode(m: &Media, lyrics: &str, translation: &str) -> String {
     STANDARD.encode(serde_json::to_vec(&packet).expect("serializable media packet"))
 }
 
+pub fn metadata_only(m: &Media) -> String {
+    let mut current = m.clone();
+    current.sent = crate::media::now_ms();
+    current.position = None;
+    let text = format!(
+        "[ti:metadata]\n[00:00.000]{}\n[00:00.001]\n",
+        m.song.title.replace(['\r', '\n'], " ")
+    );
+    encode(&current, &text, "")
+}
+
 pub fn build(m: &Media, lyrics: Option<&Lyrics>) -> String {
     if let Some(words) = lyrics {
         let main = lrc(&words.main, &words.header);
@@ -182,6 +219,37 @@ pub fn build(m: &Media, lyrics: Option<&Lyrics>) -> String {
 mod tests {
     use super::*;
     use crate::media::{Song, Source};
+    #[test]
+    fn disc_anchor_uses_the_same_cue_delay_translation_and_long_silences() {
+        let words = Lyrics::new(
+            "曲",
+            40.0,
+            "[00:02]第一句\n[00:20]第二句",
+            "[00:02.25]翻译\n[00:22]太远",
+            "测试",
+        )
+        .unwrap();
+        let mut m = Media {
+            song: Song {
+                title: "曲".into(),
+                artist: String::new(),
+                source: Source::Other,
+            },
+            position: Some(1.8),
+            duration: 40.0,
+            rate: 1.0,
+            playing: true,
+            sent: 0,
+        };
+        assert_eq!(words.displayed(&m, 0), None);
+        assert_eq!(words.displayed(&m, 250), Some(("第一句", "翻译")));
+        m.position = Some(12.0);
+        assert_eq!(words.displayed(&m, 0), None);
+        m.position = Some(21.0);
+        assert_eq!(words.displayed(&m, 0), Some(("第二句", "")));
+        m.position = None;
+        assert_eq!(words.displayed(&m, 0), None);
+    }
     #[test]
     fn timestamps_offset_and_multiple_stamps() {
         let c = cues("[offset:150]\n[00:01.5][01:20.324]雨\n[00:02]停");
@@ -232,5 +300,13 @@ mod tests {
             assert!(p["lyricsText"].as_str().unwrap().starts_with("[ti:测试]"));
             assert!(p.get("translatedText").is_some());
         }
+        let retire = metadata_only(&m);
+        let packet: serde_json::Value =
+            serde_json::from_slice(&STANDARD.decode(retire).unwrap()).unwrap();
+        let retire_lrc = packet["lyricsText"].as_str().unwrap();
+        assert!(packet["position"].is_null());
+        assert_eq!(packet["title"], m.song.title);
+        let clear = Lyrics::new("metadata", 0.0, retire_lrc, "", "测试").unwrap();
+        assert!(clear.displayed(&m, 0).is_none());
     }
 }
