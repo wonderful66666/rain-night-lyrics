@@ -129,11 +129,16 @@ fn is_ours(file: &str) -> bool {
         && parts[1..] == [WORKSHOP_ID, "431960", "content", "workshop", "steamapps"]
 }
 
-fn selected(config: &Value, user: &str) -> Vec<String> {
-    let Some(monitors) = config
+fn user_settings<'a>(config: &'a Value, user: &str) -> Option<&'a Value> {
+    config
         .as_object()
         .and_then(|root| root.iter().find(|(k, _)| k.eq_ignore_ascii_case(user)))
-        .and_then(|(_, entry)| entry.pointer("/general/wallpaperconfig/selectedwallpapers"))
+        .and_then(|(_, entry)| entry.get("general"))
+}
+
+fn selected(config: &Value, user: &str) -> Vec<String> {
+    let Some(monitors) = user_settings(config, user)
+        .and_then(|entry| entry.pointer("/wallpaperconfig/selectedwallpapers"))
         .and_then(Value::as_object)
     else {
         return vec![];
@@ -152,6 +157,35 @@ fn selected(config: &Value, user: &str) -> Vec<String> {
         })
         .map(|(name, _)| name.clone())
         .collect()
+}
+
+fn reload_target<'a>(
+    config: &'a Value,
+    user: &str,
+    display: &str,
+) -> Option<(&'a str, Option<&'a str>)> {
+    let settings = user_settings(config, user)?;
+    if let Some(device) = settings.pointer("/user/audioinputdevice") {
+        let device = device.as_str()?;
+        if !device.is_empty() && !device.eq_ignore_ascii_case("default") {
+            return None;
+        }
+    }
+    let entry = settings
+        .pointer("/wallpaperconfig/selectedwallpapers")?
+        .get(display)?;
+    if entry
+        .get("playlist")
+        .is_some_and(|value| !value.is_null() && value.as_str() != Some(""))
+    {
+        return None;
+    }
+    let file = entry.get("file")?.as_str()?;
+    let preset = entry
+        .get("preset")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    is_ours(file).then_some((file, preset))
 }
 
 impl Engine {
@@ -202,15 +236,55 @@ impl Engine {
         }
     }
 
-    pub fn displays(&self) -> Vec<String> {
-        let Ok(bytes) = fs::read(self.exe.with_file_name("config.json")) else {
-            return vec![];
-        };
+    fn config(&self) -> Option<Value> {
+        let bytes = fs::read(self.exe.with_file_name("config.json")).ok()?;
         let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
-        let Ok(config) = serde_json::from_slice(bytes) else {
-            return vec![];
-        };
-        selected(&config, &std::env::var("USERNAME").unwrap_or_default())
+        serde_json::from_slice(bytes).ok()
+    }
+
+    pub fn displays(&self) -> Vec<String> {
+        self.config()
+            .map(|c| selected(&c, &std::env::var("USERNAME").unwrap_or_default()))
+            .unwrap_or_default()
+    }
+
+    pub fn reload_audio(&self, displays: &[String]) -> (usize, bool) {
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        let mut requested = 0;
+        let mut retry = false;
+        for display in displays {
+            if process_path(self.pid).as_ref() != Some(&self.exe) {
+                break;
+            }
+            let Some(config) = self.config() else {
+                retry = true;
+                continue;
+            };
+            let Some((file, preset)) = reload_target(&config, &user, display) else {
+                continue;
+            };
+            if !Path::new(file).is_file() {
+                continue;
+            }
+            let mut command = Command::new(&self.exe);
+            command.args([
+                "-control",
+                "openWallpaper",
+                "-location",
+                display,
+                "-file",
+                file,
+            ]);
+            if let Some(preset) = preset {
+                command.args(["-preset", preset]);
+            }
+            if self.control(&mut command) {
+                requested += 1;
+            } else {
+                retry = true;
+            }
+        }
+        (requested, retry)
     }
 
     pub fn send(&self, display: &str, value: &str) -> bool {
@@ -220,15 +294,21 @@ impl Engine {
             return false;
         }
         let raw = format!("RAW~({{\"capsuleautomaticallyrics\":\"{value}\"}})~END");
-        let child = Command::new(&self.exe)
-            .args([
-                "-control",
-                "applyProperties",
-                "-location",
-                display,
-                "-properties",
-            ])
-            .raw_arg(raw)
+        self.control(
+            Command::new(&self.exe)
+                .args([
+                    "-control",
+                    "applyProperties",
+                    "-location",
+                    display,
+                    "-properties",
+                ])
+                .raw_arg(raw),
+        )
+    }
+
+    fn control(&self, command: &mut Command) -> bool {
+        let child = command
             .current_dir(self.exe.parent().unwrap())
             .creation_flags(CREATE_NO_WINDOW.0)
             .stdin(Stdio::null())
@@ -267,5 +347,25 @@ mod tests {
         assert!(!is_ours(&file.replace("431960", "431961")));
         assert!(!is_ours(&file.replace("scene.pkg", "preview.gif")));
         assert!(!is_ours("scene.pkg"));
+    }
+
+    #[test]
+    fn audio_recovery_respects_the_selected_screen_input_and_playlist() {
+        let file =
+            format!("Q:/Steam Library/steamapps/workshop/content/431960/{WORKSHOP_ID}/scene.pkg");
+        let mut config = json!({"Listener":{"general":{"wallpaperconfig":{"selectedwallpapers":{
+            "Monitor0":{"file":file,"preset":"Evening"}, "Monitor1":{"file":file.replace(WORKSHOP_ID, "10")}
+        }}}}});
+        assert_eq!(
+            reload_target(&config, "listener", "Monitor0"),
+            Some((file.as_str(), Some("Evening")))
+        );
+        assert!(reload_target(&config, "listener", "Monitor1").is_none());
+        config["Listener"]["general"]["user"] = json!({"audioinputdevice":"microphone"});
+        assert!(reload_target(&config, "listener", "Monitor0").is_none());
+        config["Listener"]["general"]["user"]["audioinputdevice"] = json!("Default");
+        config["Listener"]["general"]["wallpaperconfig"]["selectedwallpapers"]["Monitor0"]["playlist"] =
+            json!("evening rotation");
+        assert!(reload_target(&config, "listener", "Monitor0").is_none());
     }
 }

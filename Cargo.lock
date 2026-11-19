@@ -393,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "rain-night-lyrics"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "regex",
@@ -401,6 +401,7 @@ dependencies = [
  "serde_json",
  "ureq",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

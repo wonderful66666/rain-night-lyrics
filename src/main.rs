@@ -1,8 +1,10 @@
+mod audio;
 mod lookup;
 mod media;
 mod protocol;
 mod wallpaper;
 
+use audio::OutputWatch;
 use lookup::{Catalog, Outcome};
 use media::{Apartment, Media, Sessions, Song};
 use std::collections::HashMap;
@@ -101,6 +103,22 @@ fn check() -> Result<(), String> {
         engine.is_some(),
         screens.len()
     );
+    match OutputWatch::open().and_then(|w| w.status()) {
+        Ok((notifications, output)) => println!(
+            "音柱重连　设备通知 {}　默认输出 {}",
+            if notifications {
+                "可用"
+            } else {
+                "使用轮询"
+            },
+            match output {
+                None => "未连接",
+                Some(true) => "当前有声音",
+                Some(false) => "当前未测到声音",
+            }
+        ),
+        Err(_) => println!("音柱重连　暂时无法读取默认输出设备。"),
+    }
     match Sessions::open().and_then(|s| s.current()) {
         Ok(Some(m)) => println!(
             "Windows 媒体来源 {}　正在播放 {}　有进度 {}",
@@ -140,6 +158,7 @@ fn run() -> Result<(), String> {
     let mut sessions = None;
     let mut engine = None;
     let mut screens = Vec::new();
+    let mut audio = None;
     let mut poll_engine = Instant::now();
     let mut worker = Worker::new();
     let mut cache = HashMap::<Song, CacheEntry>::new();
@@ -153,6 +172,10 @@ fn run() -> Result<(), String> {
             let locations = active.as_ref().map(Engine::displays).unwrap_or_default();
             if engine != active || locations != screens {
                 sent = None;
+                audio = None;
+            }
+            if !locations.is_empty() && audio.is_none() {
+                audio = OutputWatch::open().ok();
             }
             engine = active;
             screens = locations;
@@ -175,6 +198,22 @@ fn run() -> Result<(), String> {
             continue;
         }
         let engine = engine.as_ref().unwrap();
+        if let Some(watch) = &mut audio {
+            match watch.ready(now) {
+                Ok(true) => {
+                    let (count, retry) = engine.reload_audio(&screens);
+                    if count > 0 {
+                        println!("音频输出已恢复播放，已请求重新载入 {count} 个《雨夜轻息》场景。");
+                        sent = None;
+                    }
+                    if retry {
+                        watch.retry(Instant::now());
+                    }
+                }
+                Err(_) => audio = None,
+                Ok(false) => {}
+            }
+        }
         if sessions.is_none() {
             sessions = Sessions::open().ok();
         }
